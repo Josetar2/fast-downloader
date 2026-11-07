@@ -47,6 +47,18 @@ dl = Downloader("https://example.com/file.zip", "./downloads", threads=8)
 dl.download(on_progress=lambda d, t, s: print(d, t, s))
 ```
 
+## 免安装下载（Windows / 给别人用）
+
+不想装 Python？去仓库 **Releases** 页面下载 `FastDownloader.exe`（单文件，双击即用，默认下载到桌面）：
+
+- 下载地址：`https://github.com/Josetar2/fast-downloader/releases`
+- 仓库所有者发布新版本（在本机终端，`gh` 已登录即可，无需 token 明文）：
+
+```bash
+cd "项目目录"
+gh release create v1.0.0 dist/FastDownloader.exe --title "FastDownloader v1.0.0" --notes "多线程高速下载器 · 单文件 exe · 无需安装 Python"
+```
+
 ## 说明
 
 部分网站（如百度网盘）会返回 403 禁止直链下载，这是服务器限制，本工具无法绕过。
