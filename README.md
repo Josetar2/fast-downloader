@@ -10,6 +10,7 @@
 - 实时进度 / 速度显示
 - 图形界面（tkinter，无需额外依赖）+ 命令行两种用法
 - 仅使用 Python 标准库，无需 `pip install`
+- 支持蓝奏云等「直链型网盘」分享链接自动解析下载（粘贴分享页链接即可，自动提取真实直链）
 
 ## 安装
 
@@ -49,14 +50,20 @@ dl.download(on_progress=lambda d, t, s: print(d, t, s))
 
 ## 免安装下载（Windows / 给别人用）
 
-不想装 Python？去仓库 **Releases** 页面下载 `FastDownloader.exe`（单文件，双击即用，默认下载到桌面）：
+不想装 Python？去仓库 **Releases** 页面下载，提供两种 Windows 构建：
 
-- 下载地址：`https://github.com/Josetar2/fast-downloader/releases`
-- 仓库所有者发布新版本（在本机终端，`gh` 已登录即可，无需 token 明文）：
+- `FastDownloader.exe` —— **单文件版**，双击即用（默认下载到桌面）
+- `FastDownloader_portable.zip` —— **便携版**，解压后得到一个文件夹，双击里面的 `FastDownloader.exe` 即用。**运行时不在系统盘产生任何临时 / 解压文件**，适合放 U 盘或任意目录随身携带
+
+下载地址：`https://github.com/Josetar2/fast-downloader/releases`
+
+仓库所有者发布新版本（本机终端，`gh` 已登录即可，无需 token 明文）：
 
 ```bash
 cd "项目目录"
-gh release create v1.0.0 dist/FastDownloader.exe --title "FastDownloader v1.0.0" --notes "多线程高速下载器 · 单文件 exe · 无需安装 Python"
+gh release create v1.1.0 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
+  --title "FastDownloader v1.1.0" \
+  --notes "高速多线程下载器 · 蓝奏云等直链网盘自动解析 · 单文件版 + 便携版（无 Temp 残留）"
 ```
 
 ## 说明

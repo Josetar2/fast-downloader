@@ -5,5 +5,7 @@ __pycache__/
 .venv/
 venv/
 build/
+build_onedir/
+build_onefile/
 dist/
 *.spec

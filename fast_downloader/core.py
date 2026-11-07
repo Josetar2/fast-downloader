@@ -18,6 +18,8 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from . import netdisk
+
 DEFAULT_UA = "FastDownloader/1.0 (+https://github.com/)"
 DEFAULT_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB 读取缓冲
 
@@ -58,6 +60,8 @@ class Downloader:
         self.total = 0
         self.supports_range = False
         self._ua = user_agent
+        self.effective_url = url
+        self.extra_headers = {}
 
         self._downloaded = 0
         self._lock_state = {"start": time.time(), "last": time.time(), "last_bytes": 0}
@@ -78,6 +82,7 @@ class Downloader:
 
     def _headers(self, extra: dict | None = None) -> dict:
         h = {"User-Agent": self._ua}
+        h.update(self.extra_headers)
         if extra:
             h.update(extra)
         return h
@@ -89,7 +94,7 @@ class Downloader:
     def probe(self) -> tuple[int, bool]:
         length, accept = 0, ""
         try:
-            with _open(self.url, self._headers(), self.timeout, method="HEAD") as r:
+            with _open(self.effective_url, self._headers(), self.timeout, method="HEAD") as r:
                 length = int(r.headers.get("Content-Length", "0") or 0)
                 accept = (r.headers.get("Accept-Ranges", "") or "").lower()
         except Exception:
@@ -98,7 +103,7 @@ class Downloader:
         if not (length and accept == "bytes"):
             try:
                 with _open(
-                    self.url,
+                    self.effective_url,
                     self._headers({"Range": "bytes=0-0"}),
                     self.timeout,
                     method="GET",
@@ -145,7 +150,7 @@ class Downloader:
         for attempt in range(1, self.retries + 1):
             try:
                 with _open(
-                    self.url,
+                    self.effective_url,
                     self._headers({"Range": f"bytes={last_end + 1}-{end}"}),
                     self.timeout,
                     method="GET",
@@ -189,6 +194,17 @@ class Downloader:
         os.makedirs(self.save_dir, exist_ok=True)
         os.makedirs(self.part_dir, exist_ok=True)
         self.filename = self._safe_name(self.filename)
+
+        # 网盘分享链接解析（蓝奏云等）：先解析成真实直链再下载
+        if netdisk.is_supported(self.url):
+            try:
+                resolved = netdisk.resolve(self.url)
+            except netdisk.NetdiskResolveError as e:
+                raise DownloadError(f"网盘链接解析失败：{e}")
+            if resolved:
+                self.effective_url = resolved["url"]
+                self.extra_headers = resolved.get("headers", {})
+                self.filename = self._safe_name(self._guess_filename(resolved["url"]))
 
         total, ranged = self.probe()
 
@@ -243,7 +259,7 @@ class Downloader:
         headers = {}
         if resume:
             headers["Range"] = f"bytes={os.path.getsize(part)}-"
-        with _open(self.url, self._headers(headers), self.timeout, method="GET") as r:
+        with _open(self.effective_url, self._headers(headers), self.timeout, method="GET") as r:
             cr = r.headers.get("Content-Range", "")
             if cr and "/" in cr and self.total == 0:
                 self.total = int(cr.split("/")[-1])
