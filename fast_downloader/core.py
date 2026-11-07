@@ -1,7 +1,7 @@
 """
-PCL Fast Downloader — 核心下载引擎（纯标准库，无第三方依赖）
+Fast Downloader — 核心下载引擎（纯标准库，无第三方依赖）
 
-模拟 PCL 启动器「下载自定义文件」的高速多线程下载能力：
+高速多线程下载能力：
 - 支持 HTTP Range 分块多线程下载
 - 不支持 Range 的服务器自动降级为单线程流式下载
 - 断点续传（已下载的 part 文件会被复用）
@@ -12,16 +12,21 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-DEFAULT_UA = "PCL-FastDownloader/1.0 (+https://github.com/)"
+DEFAULT_UA = "FastDownloader/1.0 (+https://github.com/)"
 DEFAULT_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB 读取缓冲
 
 
 class DownloadError(Exception):
+    pass
+
+
+class Cancelled(Exception):
     pass
 
 
@@ -56,6 +61,7 @@ class Downloader:
 
         self._downloaded = 0
         self._lock_state = {"start": time.time(), "last": time.time(), "last_bytes": 0}
+        self.cancelled = False
 
     # ---------- 工具 ----------
     @staticmethod
@@ -122,10 +128,15 @@ class Downloader:
         st["last"], st["last_bytes"] = now, self._downloaded
         return speed
 
+    def speed(self) -> float:
+        return self._snapshot_speed()
+
     # ---------- 单块下载 ----------
     def _download_chunk(self, idx: int, start: int, end: int) -> int:
         part = self._part_path(idx)
         expected = end - start + 1
+        if self.cancelled:
+            raise Cancelled()
         if os.path.exists(part) and os.path.getsize(part) == expected:
             self._bump(expected)
             return expected
@@ -148,6 +159,8 @@ class Downloader:
                             f.write(buf)
                             last_end += len(buf)
                             self._bump(len(buf))
+                            if self.cancelled:
+                                raise Cancelled()
                 return last_end - start + 1
             except Exception as e:
                 if attempt == self.retries:
@@ -186,17 +199,32 @@ class Downloader:
 
         self._downloaded = 0
         self._lock_state = {"start": time.time(), "last": time.time(), "last_bytes": 0}
+        self.cancelled = False
 
-        if ranged and total:
-            ranges = self._split_ranges(total, self.threads)
-            self.threads = len(ranges)
-            with ThreadPoolExecutor(max_workers=self.threads) as ex:
-                futs = [ex.submit(self._download_chunk, i, s, e) for i, (s, e) in enumerate(ranges)]
-                for fut in as_completed(futs):
-                    fut.result()
-            self._merge()
-        else:
-            self._download_single()
+        done_ev = threading.Event()
+
+        def _monitor() -> None:
+            while not done_ev.is_set():
+                if on_progress:
+                    on_progress(self._downloaded, self.total, self._snapshot_speed())
+                time.sleep(0.2)
+
+        mon = threading.Thread(target=_monitor, daemon=True)
+        mon.start()
+        try:
+            if ranged and total:
+                ranges = self._split_ranges(total, self.threads)
+                self.threads = len(ranges)
+                with ThreadPoolExecutor(max_workers=self.threads) as ex:
+                    futs = [ex.submit(self._download_chunk, i, s, e) for i, (s, e) in enumerate(ranges)]
+                    for fut in as_completed(futs):
+                        fut.result()
+                self._merge()
+            else:
+                self._download_single()
+        finally:
+            done_ev.set()
+            mon.join(timeout=1)
 
         self._cleanup_parts()
         done = self.total or self._downloaded
@@ -204,8 +232,13 @@ class Downloader:
             on_progress(done, done, 0.0)
         return self.filepath
 
+    def cancel(self) -> None:
+        self.cancelled = True
+
     def _download_single(self) -> None:
         part = self._part_path(0)
+        if self.cancelled:
+            raise Cancelled()
         resume = os.path.exists(part) and os.path.getsize(part) > 0
         headers = {}
         if resume:
@@ -222,6 +255,8 @@ class Downloader:
                         break
                     f.write(buf)
                     self._bump(len(buf))
+                    if self.cancelled:
+                        raise Cancelled()
         if os.path.exists(self.filepath):
             os.remove(self.filepath)
         os.rename(part, self.filepath)

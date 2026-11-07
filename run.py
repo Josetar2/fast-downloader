@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 
-from pcl_fast_downloader import cli, gui
+from fast_downloader import cli, gui
 
 
 def main() -> int:

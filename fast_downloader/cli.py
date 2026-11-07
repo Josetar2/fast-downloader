@@ -1,4 +1,4 @@
-"""命令行入口：python -m pcl_fast_downloader.cli <URL> [-o 保存目录] [-n 文件名] [-t 线程数]"""
+"""命令行入口：python -m fast_downloader.cli <URL> [-o 保存目录] [-n 文件名] [-t 线程数]"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _fmt_speed(n: float) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="PCL 风格多线程高速下载器（独立版）"
+        description="多线程高速下载器（独立版）"
     )
     p.add_argument("url", help="下载地址")
     p.add_argument("-o", "--output", default=".", help="保存目录（默认当前目录）")
