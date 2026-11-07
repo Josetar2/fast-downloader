@@ -9,8 +9,10 @@
 - 断点续传：中断后重跑会复用已下载的分块
 - 实时进度 / 速度显示
 - 图形界面（tkinter，无需额外依赖）+ 命令行两种用法
+- **任务管理器式图形界面**：左侧导航（新建下载 / 任务列表 / 完成记录 / 设置），支持多任务并发下载、排队、取消，任务列表实时显示进度 / 速度 / 剩余时间
 - 仅使用 Python 标准库，无需 `pip install`
 - 支持蓝奏云等「直链型网盘」分享链接自动解析下载（粘贴分享页链接即可，自动提取真实直链）
+- 现代扁平图标（蓝渐变圆角方块 + 下载箭头），纯标准库生成，已内嵌至 exe
 
 ## 安装
 
@@ -61,9 +63,9 @@ dl.download(on_progress=lambda d, t, s: print(d, t, s))
 
 ```bash
 cd "项目目录"
-gh release create v1.1.0 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
-  --title "FastDownloader v1.1.0" \
-  --notes "高速多线程下载器 · 蓝奏云等直链网盘自动解析 · 单文件版 + 便携版（无 Temp 残留）"
+gh release create v1.2.0 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
+  --title "FastDownloader v1.2.0" \
+  --notes "高速多线程下载器 · 侧边导航多任务管理界面 · 蓝奏云等直链网盘自动解析 · 新扁平图标 · 单文件版 + 便携版（无 Temp 残留）"
 ```
 
 ## 说明
@@ -79,8 +81,8 @@ gh release create v1.1.0 dist/FastDownloader.exe dist/FastDownloader_portable.zi
 py -3.14 -m venv D:\fd-venv
 D:\fd-venv\Scripts\pip install pyinstaller
 
-# 进入本项目目录后打包（--windowed 不弹黑框，--onefile 单文件）
-D:\fd-venv\Scripts\pyinstaller --onefile --windowed --name FastDownloader run.py
+# 进入本项目目录后打包（--windowed 不弹黑框，--onefile 单文件，--icon 内嵌图标）
+D:\fd-venv\Scripts\pyinstaller --onefile --windowed --name FastDownloader --icon app.ico --add-data "app.ico;." run.py
 ```
 
 产物在 `dist/FastDownloader.exe`。直接双击运行即是图形界面；命令行用法：
