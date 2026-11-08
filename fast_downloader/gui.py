@@ -102,10 +102,8 @@ def _win_api():
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     u.IsZoomed.argtypes = [wintypes.HWND]
     u.IsZoomed.restype = wintypes.BOOL
-    u.ReleaseCapture.argtypes = []
-    u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
-                               wintypes.WPARAM, wintypes.LPARAM]
-    u.SendMessageW.restype = wintypes.LPARAM
+    # 不使用 SendMessageW/ReleaseCapture 触发 WM_NCLBUTTONDOWN：
+    # 那是同步模态循环，会重入 Tcl 解释器导致卡死/闪退。
     return u
 
 
@@ -330,8 +328,56 @@ class Card(tk.Frame):
         self._cv.configure(height=h)
 
 
+class WinCtl(tk.Canvas):
+    """标题栏右侧的窗口控制按钮（自绘，尺寸随 DPI 缩放）。"""
+
+    def __init__(self, parent, glyph, action, danger=False):
+        cw, ch = _s(44), _s(30)
+        super().__init__(parent, width=cw, height=ch, bg=TITLE_BG,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.pack(side="left", padx=_s(1))
+        self._cw, self._ch = cw, ch
+        self._glyph, self._action = glyph, action
+        self._danger, self._hover = danger, False
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        # 只在这里触发动作，绝不绑定父级标题栏的拖动回调
+        self.bind("<Button-1>", self._click)
+        self.draw()
+
+    def _enter(self, e):
+        self._hover = True
+        self.draw()
+
+    def _leave(self, e):
+        self._hover = False
+        self.draw()
+
+    def _click(self, e):
+        self._action()
+        return "break"
+
+    def set_glyph(self, glyph):
+        self._glyph = glyph
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        hot = self._danger and self._hover
+        bg = "#E81123" if hot else ("#E2E2E8" if self._hover else TITLE_BG)
+        fg = "#FFFFFF" if hot else "#3E3E44"
+        _solid_rr(self, 0, 0, self._cw, self._ch, _s(5), bg)
+        self.create_text(self._cw / 2, self._ch / 2 - 1, text=self._glyph,
+                         fill=fg, font=(UI_FAM, 11, "bold"))
+
+
 class TitleBar(tk.Frame):
-    """自绘标题栏：交通灯 + 居中标题（系统标题栏已隐藏）。"""
+    """自绘标题栏：左交通灯 + 居中标题 + 右侧窗口控制按钮。
+
+    拖动只走 Tk 的 Button-1 / B1-Motion，绝不调用
+    SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION)：那是同步的模态移动循环，
+    会在 Tcl 回调内嵌套 Win32 消息循环并重入解释器，导致卡死/闪退。
+    """
 
     H = 44
 
@@ -342,7 +388,10 @@ class TitleBar(tk.Frame):
         self.pack(side="top", fill="x")
         self.pack_propagate(False)
         self._page = page
+        self._drag = None      # 拖动中的 (dx, dy)；为 None 表示未拖动
+        self._last = None
 
+        # ---- 左：macOS 交通灯，符号常显且真实可点 ----
         lamps = tk.Canvas(self, width=_s(88), height=self.H, bg=TITLE_BG,
                           highlightthickness=0, bd=0)
         lamps.pack(side="left", padx=(_s(10), 0))
@@ -350,20 +399,33 @@ class TitleBar(tk.Frame):
                  (LAMP_YELLOW, "−", "#7A4E00", app._minimize),
                  (LAMP_GREEN, "+", "#00420A", app._toggle_zoom))
         for i, (color, mark, ink, action) in enumerate(specs):
-            x = _s(12) + i * _s(21)
+            cx = _s(18.5) + i * _s(21)
             cy = self.H / 2
-            oval = lamps.create_oval(x, cy - _s(6.5), x + _s(13), cy + _s(6.5),
+            # 与背景同色的矩形作为放大的点击热区（视觉不可见）
+            hit = lamps.create_rectangle(cx - _s(9), cy - _s(14),
+                                         cx + _s(9), cy + _s(14),
+                                         fill=TITLE_BG, outline="")
+            oval = lamps.create_oval(cx - _s(6.5), cy - _s(6.5),
+                                     cx + _s(6.5), cy + _s(6.5),
                                      fill=color, outline="", width=0)
-            txt = lamps.create_text(x + _s(6.5), cy - 0.5, text=mark, fill=ink,
-                                    font=(UI_FAM, 9, "bold"), state="hidden")
-            for item in (oval, txt):
+            txt = lamps.create_text(cx, cy - 0.5, text=mark, fill=ink,
+                                    font=(UI_FAM, 9, "bold"))
+            for item in (hit, oval, txt):
                 lamps.tag_bind(item, "<Enter>",
-                               lambda e, t=txt: lamps.itemconfig(t, state="normal"))
+                               lambda e, h=hit: lamps.itemconfig(h, fill="#E9E9EE"))
                 lamps.tag_bind(item, "<Leave>",
-                               lambda e, t=txt: lamps.itemconfig(t, state="hidden"))
+                               lambda e, h=hit: lamps.itemconfig(h, fill=TITLE_BG))
                 lamps.tag_bind(item, "<Button-1>",
                                lambda e, a=action: (a(), "break")[1])
         self.lamps = lamps
+
+        # ---- 右：明确的最小化 / 最大化 / 关闭按钮 ----
+        ctrl = tk.Frame(self, bg=TITLE_BG)
+        ctrl.pack(side="right", padx=(0, _s(8)))
+        WinCtl(ctrl, "—", app._minimize)
+        self._zoom_btn = WinCtl(ctrl, "□", app._toggle_zoom)
+        WinCtl(ctrl, "✕", app._close, danger=True)
+        self._ctrl = ctrl
 
         self.title = tk.Label(self, text=page, bg=TITLE_BG, fg="#48484E",
                               font=FONT_TITLE)
@@ -372,9 +434,12 @@ class TitleBar(tk.Frame):
         tk.Frame(self, bg=SEPARATOR, height=max(1, _s(1))).place(
             relx=0, rely=1.0, relwidth=1, anchor="sw")
 
-        for widget in (self, lamps, self.title):
+        # 注意：lamps / 右侧按钮都不绑拖动，否则点按钮会触发移动回调。
+        # 子控件的 bind 不会冒泡到父 Frame，因此点按钮不会启动拖动。
+        for widget in (self, self.title):
             widget.bind("<Button-1>", self._press)
             widget.bind("<B1-Motion>", self._move)
+            widget.bind("<ButtonRelease-1>", self._release)
             widget.bind("<Double-Button-1>", lambda e: app._toggle_zoom())
 
     def set_page(self, name):
@@ -382,25 +447,33 @@ class TitleBar(tk.Frame):
         self.title.config(text=name)
 
     def _press(self, e):
-        # 交给 Windows 原生拖动循环（支持贴靠/阴影/多显示器），比自绘更顺滑
-        h = getattr(self.app, "_hwnd", None)
-        if IS_WIN and h:
+        # 非阻塞：只记录起点，绝不进入 Win32 模态循环
+        if IS_WIN and getattr(self.app, "_hwnd", None):
             try:
-                u = _win_api()
-                u.ReleaseCapture()
-                u.SendMessageW(h, 0x00A1, 2, 0)  # WM_NCLBUTTONDOWN / HTCAPTION
-                return "break"
+                if _win_api().IsZoomed(self.app._hwnd):
+                    self.app._toggle_zoom()   # 最大化态先还原，避免拖动异常
+                    self.app.update_idletasks()
             except Exception:
                 pass
-        self._ox = e.x_root - self.app.winfo_rootx()
-        self._oy = e.y_root - self.app.winfo_rooty()
+        self._drag = (e.x_root - self.app.winfo_rootx(),
+                      e.y_root - self.app.winfo_rooty())
+        self._last = None
+        return "break"
 
     def _move(self, e):
-        if IS_WIN and getattr(self.app, "_hwnd", None):
+        if not self._drag:
             return
-        if not hasattr(self, "_ox"):
+        ox, oy = self._drag
+        pos = (e.x_root - ox, e.y_root - oy)
+        if pos == self._last:
             return
-        self.app.geometry(f"+{e.x_root - self._ox}+{e.y_root - self._oy}")
+        self._last = pos
+        self.app.geometry(f"+{pos[0]}+{pos[1]}")
+        return "break"
+
+    def _release(self, e):
+        self._drag = None
+        self._last = None
 
 
 class NavItem(tk.Canvas):
@@ -717,13 +790,17 @@ class App(tk.Tk):
         # 隐藏 Windows 系统标题栏，保留系统边框/阴影/任务栏/最小化/缩放
         self.update_idletasks()
         self._mac_frame()
-        self.after(180, self._mac_frame)
+        # 仅在首次未取到顶层句柄时重试，避免窗口显示后重复改样式
+        self.after(180, lambda: self._hwnd is None and self._mac_frame())
         self._tick()
 
     def _on_resize(self, e):
         """窗口缩放时侧栏与内容区一起跟随，避免固定宽度显得脱节。"""
         if e.widget is not self or not hasattr(self, "side"):
             return
+        tb = getattr(self, "_titlebar", None)
+        if tb is not None and getattr(tb, "_drag", None):
+            return  # 拖动中尺寸未变，跳过重排，避免 Configure 反复触发
         target = max(self._side_min, min(_s(280), int(e.width * 0.18)))
         if abs(target - self.side.winfo_width()) > 1:
             self.side.configure(width=target)
@@ -769,28 +846,38 @@ class App(tk.Tk):
         self._on_close()
 
     def _minimize(self):
-        if IS_WIN and self._hwnd:
-            try:
-                _win_api().ShowWindow(self._hwnd, 6)  # SW_MINIMIZE
-                return
-            except Exception:
-                pass
-        self.iconify()
+        # Tk 的 iconify 会同步维护窗口状态，恢复比直接 ShowWindow 可靠
+        try:
+            self.iconify()
+        except Exception:
+            if IS_WIN and self._hwnd:
+                try:
+                    _win_api().ShowWindow(self._hwnd, 6)  # SW_MINIMIZE
+                except Exception:
+                    pass
 
     def _toggle_zoom(self):
+        zoomed = None
         if IS_WIN and self._hwnd:
             try:
                 u = _win_api()
                 if u.IsZoomed(self._hwnd):
                     u.ShowWindow(self._hwnd, 9)  # SW_RESTORE
-                    self._zoomed = False
+                    zoomed = False
                 else:
                     u.ShowWindow(self._hwnd, 3)  # SW_MAXIMIZE
-                    self._zoomed = True
-                return
+                    zoomed = True
             except Exception:
-                pass
-        self.attributes("-zoomed", not self.attributes("-zoomed"))
+                zoomed = None
+        if zoomed is None:
+            cur = bool(self.attributes("-zoomed"))
+            self.attributes("-zoomed", not cur)
+            zoomed = not cur
+        self._zoomed = zoomed
+        tb = getattr(self, "_titlebar", None)
+        btn = getattr(tb, "_zoom_btn", None) if tb is not None else None
+        if btn is not None:
+            btn.set_glyph("❐" if zoomed else "□")
 
     # ---------- 路径 ----------
     def _app_path(self, name: str) -> str:
