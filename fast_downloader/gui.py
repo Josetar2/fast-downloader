@@ -13,7 +13,13 @@ from tkinter import filedialog, messagebox, ttk
 from . import netdisk
 from .core import DEFAULT_THREADS, MAX_THREADS, Downloader, DownloadError
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
+
+# 默认窗口尺寸：1000×600 物理像素（用户指定够用的尺寸）。
+DEFAULT_W, DEFAULT_H = 1000, 600
+# 窗口位置记忆文件的格式版本。旧版只写 "1500x1020+530+290"，
+# 改默认尺寸后若继续沿用旧记录，新装的程序仍会按老尺寸打开，因此换格式一次性重来。
+GEOM_VERSION = "v2"
 
 # 线程数下拉档位：不给 1~128 全列（太长、还会诱导选无意义的碎块），
 # 只给工程上真正有区别的几档，选满 128 时也会按文件大小自动收敛分块数。
@@ -738,14 +744,15 @@ class App(tk.Tk):
         super().__init__()
         self.title("高速下载器")
         _init_fonts(self)  # 必须先算 SCALE，后面所有 _s() 几何才按真实 DPI 放大
+        # 默认窗口 1000×600 物理像素（用户指定的大小），屏幕比这小则内缩。
         try:
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
-            w = max(_s(560), min(_s(1000), int(sw * 0.62)))
-            h = max(_s(420), min(_s(680), int(sh * 0.68)))
-            self.geometry(f"{w}x{h}")
         except Exception:
-            self.geometry(f"{_s(960)}x{_s(650)}")
+            sw, sh = 1920, 1080
+        w = min(DEFAULT_W, max(360, sw - _s(40)))
+        h = min(DEFAULT_H, max(280, sh - _s(80)))
+        self.geometry(f"{w}x{h}")
         self.resizable(True, True)
         # 最小约一张身份证（85.6×54mm ≈ 320×210 逻辑像素），主打简约。
         # 不再把 minsize 定到 900×680，窗口可真正自由地缩到很小。
@@ -885,6 +892,12 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _set_info(self, text):
+        """解析结果行：没内容就不占位，避免默认尺寸下白占一行高度。"""
+        self._new_info.configure(text=text)
+        self._grid_state(self._new_info,
+                         bool(text.strip()) and self._mode != 2)
+
     def _relayout(self, w, h):
         logical = w / max(SCALE, 1.0)
         mode = 0 if logical >= 860 else (1 if logical >= 560 else 2)
@@ -924,7 +937,7 @@ class App(tk.Tk):
         compact, mini = mode > 0, mode == 2
         pad = CARD_PAD if mode == 0 else (_s(9) if mode == 1 else _s(6))
         body_pad = PADX if mode == 0 else (_s(14) if mode == 1 else _s(8))
-        py = PADY if mode == 0 else (_s(10) if mode == 1 else _s(4))
+        py = PADY if mode == 0 else (_s(7) if mode == 1 else _s(4))
         if compact != self._compact:
             self._compact = compact
             self._set_sidebar_compact(compact)
@@ -958,7 +971,8 @@ class App(tk.Tk):
             self._grid_state(w, not mini)
         self._grid_state(self._parse_btn, not mini)
         self._grid_state(self._threads_note, not mini)
-        self._grid_state(self._new_info, not mini)
+        self._grid_state(self._new_info,
+                         (not mini) and bool(self._new_info.cget("text").strip()))
         self._pack_state(self._open_btn, not mini)
         for w in self._set_optional:
             self._grid_state(w, not mini)
@@ -982,16 +996,13 @@ class App(tk.Tk):
             self.geometry(saved)
             self.update_idletasks()
             return
+        # 无记录（或旧格式记录）：按默认 1000×600 居中摆放
         try:
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         except Exception:
             return
-        w, h = self.winfo_width(), self.winfo_height()
-        w = min(w, max(360, sw - 20))
-        h = min(h, max(280, sh - 80))
-        if w != self.winfo_width() or h != self.winfo_height():
-            self.geometry(f"{w}x{h}")
-            self.update_idletasks()
+        w = min(DEFAULT_W, max(360, sw - _s(40)))
+        h = min(DEFAULT_H, max(280, sh - _s(80)))
         x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
@@ -1011,6 +1022,11 @@ class App(tk.Tk):
                 return None
             with open(p, "r", encoding="utf-8") as f:
                 data = f.read().strip()
+            # 只认当前格式；旧的裸 "1500x1020+530+290" 直接忽略，
+            # 让升级后的第一次启动按新的默认 1000×600 居中，随后再记忆。
+            if not data.startswith(GEOM_VERSION + " "):
+                return None
+            data = data[len(GEOM_VERSION) + 1:].strip()
             if re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", data):
                 return data
         except Exception:
@@ -1021,7 +1037,7 @@ class App(tk.Tk):
         try:
             self.update_idletasks()
             with open(self._config_path(), "w", encoding="utf-8") as f:
-                f.write(self.geometry())
+                f.write(f"{GEOM_VERSION} {self.geometry()}")
         except Exception:
             pass
 
@@ -1203,17 +1219,17 @@ class App(tk.Tk):
         self.name_e = Field(rown, _make_entry)
         self.name_e.grid(row=0, column=0, sticky="ew")
 
-        threads_label = tk.Label(f, text="线程数", bg=CARD, fg=TEXT, font=FONT,
-                                 anchor="w")
+        # 线程数提示并入标签：单独占一行会让 1000×600 默认尺寸下多出约 40px，
+        # 卡片底部被挤出可视区，右侧常驻细滚动条。
+        threads_label = tk.Label(
+            f, text=f"线程数（默认 {DEFAULT_THREADS}，最高 {MAX_THREADS}）",
+            bg=CARD, fg=TEXT, font=FONT, anchor="w")
         threads_label.grid(row=6, column=0, sticky="w", pady=(_s(14), 4))
         self.threads_e = Field(f, lambda c: _make_combo(
             c, THREAD_CHOICES, str(DEFAULT_THREADS)),
             width=116)
         self.threads_e.grid(row=7, column=0, sticky="w", pady=2)
-        self._threads_note = tk.Label(
-            f, text=f"默认 {DEFAULT_THREADS}，最高 {MAX_THREADS}（按文件大小自动分块）",
-            bg=CARD, fg=SUB, font=FONT_SM, anchor="w")
-        self._threads_note.grid(row=7, column=1, sticky="w", padx=(_s(12), 0))
+        self._threads_note = threads_label
 
         self.new_info = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SM,
                                  anchor="w")
@@ -1265,9 +1281,9 @@ class App(tk.Tk):
                             threads=_ui_threads())
             dl.extra_headers = headers
             total, ranged = dl.probe()
-            self.new_info.config(
-                text=f"文件名：{name}    大小：{_fmt(total) if total else '未知'}    "
-                     f"支持分块：{'是' if ranged else '否'}")
+            self._set_info(
+                f"文件名：{name}    大小：{_fmt(total) if total else '未知'}    "
+                f"支持分块：{'是' if ranged else '否'}")
             if not self.name_e.get().strip():
                 self.name_e.delete(0, tk.END)
                 self.name_e.insert(0, name)
