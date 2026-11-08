@@ -12,12 +12,12 @@
 - **任务管理器式图形界面**：左侧导航（新建下载 / 任务列表 / 完成记录 / 设置），支持多任务并发下载、排队、取消，任务列表实时显示进度 / 速度 / 剩余时间
 - 仅使用 Python 标准库，无需 `pip install`
 - 支持蓝奏云等「直链型网盘」分享链接自动解析下载（粘贴分享页链接即可，自动提取真实直链）
-- 现代扁平图标（蓝渐变圆角方块 + 下载箭头），纯标准库生成，已内嵌至 exe
-- **macOS 风格界面**：无边框圆角窗口 + 红黄绿交通灯、浅灰侧栏、圆角胶囊导航、白色圆角卡片与蓝色圆角按钮，主色 `#007AFF`
-- **三档响应式布局**：窗口可从最大化一路缩到约一张身份证大小（最小 320×210 逻辑像素），内部 UI 随窗口连续重排。宽屏显示完整表单；中等宽度压紧行距；极窄时侧栏折叠为图标轨道、只保留「链接 + 开始下载」，内容超高时卡片自动出现滚动条，任何尺寸都不会裁掉按钮
-- **拖动干净利落**：纯 Tk 非阻塞拖动，逐帧让系统重绘旧位置，不会出现多层窗口边框残影，也不会卡死/闪退
+- 简约矢量图标（细线方框 + 下载箭头），纯标准库生成，已内嵌至 exe
+- **Windows 原生窗口 + 简约矢量界面**：系统原生标题栏与最小化 / 最大化 / 关闭按钮、直角 1px 细线卡片与输入框、纯色无阴影、蓝色左侧竖条导航、矢量线条图标，主色 `#0F6CBD`
+- **三档响应式布局**：窗口可从最大化一路缩到约一张身份证大小（最小 320×210 逻辑像素），内部 UI 随窗口连续重排。宽屏显示完整表单；中等宽度压紧行距；极窄时侧栏折叠为图标轨道、只保留「链接 + 开始下载」，内容超高时卡片右侧浮出一根圆头细滑块（无箭头无槽线，支持拖拽与滚轮），任何尺寸都不会裁掉按钮
+- **拖动干净利落**：拖动、缩放全部由 Windows DWM 原生处理，界面不参与逐帧重绘，因此零残影、不撕裂、不卡顿，也不存在卡死 / 闪退
 - **窗口与内部布局自适应**：侧栏、卡片、输入框、任务行随窗口尺寸变化；窗口大小与位置自动记忆
-- **高 DPI 清晰渲染**：exe 内嵌 PerMonitor 清单，Tk 按真实 DPI 缩放字体，同时把几何尺寸等比放大、加深文字与边框对比度，高缩放屏（125% / 150%）不发虚
+- **高 DPI 清晰渲染**：exe 内嵌 PerMonitor 清单，Tk 按真实 DPI 缩放字体，同时把几何尺寸等比放大，高缩放屏（125% / 150%）不发虚
 
 ## 安装
 
@@ -68,9 +68,9 @@ dl.download(on_progress=lambda d, t, s: print(d, t, s))
 
 ```bash
 cd "项目目录"
-gh release create v1.4.1 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
-  --title "FastDownloader v1.4.1" \
-  --notes "高速多线程下载器 · 默认最大 16 线程 · 窗口可缩到身份证大小的三档响应式布局 · 拖动无残影不闪退 · 单文件版 + 便携版（无 Temp 残留）"
+gh release create v1.4.2 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
+  --title "FastDownloader v1.4.2" \
+  --notes "高速多线程下载器 · 默认最大 16 线程 · Windows 原生窗口拖动零残影 · 简约矢量界面 · 可缩到身份证大小的三档响应式布局 · 单文件版 + 便携版（无 Temp 残留）"
 ```
 
 ## 说明
@@ -93,7 +93,7 @@ D:\fd-venv\Scripts\pyinstaller --onefile --windowed --name FastDownloader --icon
 产物在 `dist/FastDownloader.exe`。直接双击运行即是图形界面；命令行用法：
 
 ```bash
-FastDownloader.exe "https://example.com/file.zip" -o D:\Downloads -n file.zip -t 8
+FastDownloader.exe "https://example.com/file.zip" -o D:\Downloads -n file.zip -t 16
 ```
 
 图形界面默认保存位置为「桌面」，可在窗口里改成任意目录。
