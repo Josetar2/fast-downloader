@@ -33,8 +33,16 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     dl = Downloader(args.url, args.output, filename=args.name, threads=args.threads)
-    total, ranged = dl.probe()
+    try:
+        dl.prepare()
+        total, ranged = dl.probe()
+    except DownloadError as e:
+        print(f"解析失败：{e}", file=sys.stderr)
+        return 1
+
     print(f"文件：{dl.filename}")
+    if dl.resolve_note:
+        print(f"解析：{dl.resolve_note}")
     print(f"大小：{_fmt_size(total) if total else '未知'}")
     print(f"分块：{'支持（%d 线程）' % dl.threads if ranged else '不支持，降级单线程'}")
 

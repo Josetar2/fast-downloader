@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import netdisk
+from . import github, netdisk
 from .core import DEFAULT_THREADS, MAX_THREADS, Downloader, DownloadError
 
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 
 # 默认窗口尺寸：1000×600 物理像素（用户指定够用的尺寸）。
 DEFAULT_W, DEFAULT_H = 1000, 600
@@ -1072,6 +1073,7 @@ class App(tk.Tk):
         self._pack_opts = {}
         self._pack_before = {}
         self._ready = False
+        self._resolving = False    # 后台解析中，防止重复点「解析」
 
         ico = self._app_path("app.ico")
         if os.path.exists(ico):
@@ -1182,11 +1184,21 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def _set_info(self, text):
-        """解析结果行：没内容就不占位，避免默认尺寸下白占一行高度。"""
-        self._new_info.configure(text=text)
-        self._grid_state(self._new_info,
-                         bool(text.strip()) and self._mode != 2)
+    def _set_info(self, text, err=False):
+        """解析结果：跟在按钮右侧显示，不额外占用一行高度。"""
+        self._new_info.configure(text=text, fg=("#C0392B" if err else SUB))
+        self._info_show(bool(text.strip()))
+
+    def _info_show(self, visible):
+        visible = bool(visible) and self._mode != 2
+        try:
+            cur = self._new_info.winfo_manager()
+            if visible and cur != "pack":
+                self._new_info.pack(side="left", padx=(_s(12), 0))
+            elif not visible and cur == "pack":
+                self._new_info.pack_forget()
+        except Exception:
+            pass
 
     def _relayout(self, w, h):
         logical = w / max(SCALE, 1.0)
@@ -1264,12 +1276,11 @@ class App(tk.Tk):
             self._grid_state(w, not mini)
         self._grid_state(self._parse_btn, not mini)
         self._grid_state(self._threads_note, not mini)
-        self._grid_state(self._new_info,
-                         (not mini) and bool(self._new_info.cget("text").strip()))
         self._pack_state(self._open_btn, not mini)
         for w in self._set_optional:
             self._grid_state(w, not mini)
-        self._new_info.configure(wraplength=_s(230) if mini else 0)
+        # 解析结果跟着按钮走：极简档收起，其余档按是否有内容决定
+        self._info_show(bool(self._new_info.cget("text").strip()))
         self._start_btn.resize(_s(160) if mini else _s(120))
         for c in Card._registry:
             c.set_density(pad, body_pad)
@@ -1545,20 +1556,19 @@ class App(tk.Tk):
         self.threads_e.grid(row=7, column=0, sticky="w", pady=2)
         self._threads_note = threads_label
 
-        self.new_info = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SM,
-                                 anchor="w")
-        self.new_info.grid(row=8, column=0, columnspan=3, sticky="w",
-                           pady=(_s(14), _s(2)))
-        self._new_info = self.new_info
-
         btns = tk.Frame(f, bg=CARD)
-        btns.grid(row=9, column=0, columnspan=3, sticky="w", pady=(_s(14), 0))
+        btns.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(_s(14), 0))
         self._start_btn = FlatButton(btns, "开始下载", self._add_task,
                                     kind="primary", width=120, bg=CARD)
         self._start_btn.pack(side="left", padx=(0, _s(10)))
         self._open_btn = FlatButton(btns, "打开文件夹", self._open_folder,
                                    width=112, bg=CARD)
         self._open_btn.pack(side="left")
+        # 解析结果显示在按钮右侧同一行：单独占一行会让 1000×600 下的卡片
+        # 高出一截，右侧常驻细滚动条
+        self.new_info = tk.Label(btns, text="", bg=CARD, fg=SUB, font=FONT_SM,
+                                 anchor="w")
+        self._new_info = self.new_info
         # 极简模式下收起的控件
         self._new_optional = [save_label, row1, name_label, rown,
                               threads_label, self.threads_e]
@@ -1583,26 +1593,57 @@ class App(tk.Tk):
         if not url:
             messagebox.showwarning("提示", "请先填写下载链接")
             return
+        if self._resolving:
+            return
+        self._resolving = True
+        self._resolve_q = queue.Queue()
+        self._set_info("正在解析链接…")
+        # 解析要发网络请求（GitHub 页面还要打 API），放后台线程，
+        # 避免慢域名把界面卡住十几秒。注意：控件只能在主线程读，
+        # 保存目录与线程数先取好再传进去；结果用队列回传，子线程不碰 Tk。
+        threading.Thread(
+            target=self._resolve_bg,
+            args=(url, self.save_e.get() or ".", _ui_threads()),
+            daemon=True).start()
+        self.after(120, self._poll_resolve)
+
+    def _resolve_bg(self, url, save_dir, threads):
+        info, name, err = "", None, None
         try:
-            eff, headers = url, {}
-            name = Downloader._guess_filename(url)
-            if netdisk.is_supported(url):
-                r = netdisk.resolve(url)
-                eff = r["url"]
-                headers = r.get("headers", {})
-                name = Downloader._guess_filename(eff)
-            dl = Downloader(eff, self.save_e.get() or ".", filename=name,
-                            threads=_ui_threads())
-            dl.extra_headers = headers
+            dl = Downloader(url, save_dir, threads=threads)
+            dl.prepare()
             total, ranged = dl.probe()
-            self._set_info(
-                f"文件名：{name}    大小：{_fmt(total) if total else '未知'}    "
-                f"支持分块：{'是' if ranged else '否'}")
-            if not self.name_e.get().strip():
-                self.name_e.delete(0, tk.END)
-                self.name_e.insert(0, name)
+            name = dl.filename
+            # 结果显示在按钮右侧，横向空间有限，只留最关键的三项
+            info = (f"{name} · {_fmt(total) if total else '未知'} · "
+                    f"{'可分块' if ranged else '单线程'}")
+            if dl.resolve_note:
+                info = f"{info} · {dl.resolve_note}"
         except Exception as e:
-            messagebox.showerror("解析失败", str(e))
+            err = (github.describe_error(url, e)
+                   if github.is_github(url) else str(e))
+        self._resolve_q.put((info, name, err))
+
+    def _poll_resolve(self):
+        if not self._resolving:
+            return
+        try:
+            info, name, err = self._resolve_q.get_nowait()
+        except queue.Empty:
+            self.after(120, self._poll_resolve)
+            return
+        self._resolving = False
+        self._resolve_done(info, name, err)
+
+    def _resolve_done(self, info, name, err):
+        if err:
+            # 就地一行提示，不弹模态框打断操作
+            self._set_info(_elide(err, _s(380), FONT_SM), err=True)
+            return
+        self._set_info(_elide(info, _s(380), FONT_SM))
+        if name and not self.name_e.get().strip():
+            self.name_e.delete(0, tk.END)
+            self.name_e.insert(0, name)
 
     def _add_task(self):
         url = self.url_e.get().strip()
@@ -1610,7 +1651,20 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请先填写下载链接")
             return
         threads = _ui_threads(self.threads_e.get())
-        t = Task(url, self.save_e.get() or ".", self.name_e.get().strip() or None, threads)
+        name = self.name_e.get().strip() or None
+        # GitHub 页面链接先就地解析成真实文件地址，任务里只存直链：
+        # 免得每刷新一次界面就去打一次 API，也便于之后「重试」直接复用
+        if github.is_github(url):
+            try:
+                tmp = Downloader(url, self.save_e.get() or ".", threads=threads)
+                tmp.prepare()
+                url = tmp.effective_url
+                if not name:
+                    name = tmp.filename
+            except Exception as e:
+                messagebox.showerror("解析失败", github.describe_error(url, e))
+                return
+        t = Task(url, self.save_e.get() or ".", name, threads)
         self.mgr.add(t)
         self._show("任务列表")
 

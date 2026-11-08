@@ -9,3 +9,5 @@ build_onedir/
 build_onefile/
 dist/
 *.spec
+dist_dir/
+dist_one/

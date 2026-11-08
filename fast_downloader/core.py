@@ -12,13 +12,15 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from . import netdisk
+from . import github, netdisk
 
 DEFAULT_UA = "FastDownloader/1.0 (+https://github.com/)"
 DEFAULT_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB 读取缓冲
@@ -40,9 +42,27 @@ class Cancelled(Exception):
     pass
 
 
+class _KeepMethodRedirect(urllib.request.HTTPRedirectHandler):
+    """跟随 302 时保留原始请求方法。
+
+    urllib 默认的 redirect_request 重建 Request 时没带 method，HEAD 会被悄悄
+    改成 GET —— 结果是「探测文件大小」变成「真的开始下载整个文件」。GitHub 的
+    下载链接全部靠 302 跳转，这个坑尤其明显，所以这里显式把方法传回去。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            new.method = req.get_method()
+        return new
+
+
+_OPENER = urllib.request.build_opener(_KeepMethodRedirect)
+
+
 def _open(url: str, headers: dict, timeout: int, method: str = "GET"):
     req = urllib.request.Request(url, headers=headers, method=method)
-    return urllib.request.urlopen(req, timeout=timeout)
+    return _OPENER.open(req, timeout=timeout)
 
 
 class Downloader:
@@ -58,6 +78,9 @@ class Downloader:
     ) -> None:
         self.url = url
         self.save_dir = save_dir
+        # 没手动给文件名时记为「自动」，后面允许被 Content-Disposition /
+        # GitHub 解析结果覆盖成真实文件名
+        self._auto_name = not filename
         self.filename = filename or self._guess_filename(url)
         self.threads = max(1, min(int(threads), MAX_THREADS))
         self.timeout = timeout
@@ -70,6 +93,9 @@ class Downloader:
         self._ua = user_agent
         self.effective_url = url
         self.extra_headers = {}
+        self._content_type = ""
+        self.resolve_note = ""
+        self._prepared = False
 
         self._downloaded = 0
         self._lock_state = {"start": time.time(), "last": time.time(), "last_bytes": 0}
@@ -99,27 +125,74 @@ class Downloader:
         return os.path.join(self.part_dir, f"part.{idx}")
 
     # ---------- 探测 ----------
+    @staticmethod
+    def _filename_from_cd(cd: str) -> str | None:
+        """从 Content-Disposition 里取服务端给的真实文件名。
+
+        GitHub 的源码包地址（codeload.github.com/o/r/zip/refs/heads/main）路径
+        末段只有分支名，不带扩展名；真实文件名藏在响应头里，不取就会存成一个
+        没有后缀的 `main`。
+        """
+        if not cd:
+            return None
+        m = re.search(r"filename\*\s*=\s*(?:UTF-8|utf-8)?''([^;]+)", cd)
+        if m:
+            return urllib.parse.unquote(m.group(1).strip().strip('"'))
+        m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.I)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"filename\s*=\s*([^;]+)", cd, re.I)
+        return m.group(1).strip().strip('"') if m else None
+
+    def _sync_paths(self) -> None:
+        self.filepath = os.path.join(self.save_dir, self._safe_name(self.filename))
+        self.filename = os.path.basename(self.filepath)
+        self.part_dir = self.filepath + ".parts"
+
     def probe(self) -> tuple[int, bool]:
-        length, accept = 0, ""
+        # 探测只是"问问有多大"，不该让界面等太久。
+        t_probe = min(self.timeout, 8)
+        length, accept, ctype, cdisp = 0, "", "", ""
+        unreachable = False
         try:
-            with _open(self.effective_url, self._headers(), self.timeout, method="HEAD") as r:
+            with _open(self.effective_url, self._headers(), t_probe, method="HEAD") as r:
                 length = int(r.headers.get("Content-Length", "0") or 0)
                 accept = (r.headers.get("Accept-Ranges", "") or "").lower()
+                ctype = (r.headers.get("Content-Type", "") or "").lower()
+                cdisp = r.headers.get("Content-Disposition", "") or ""
+        except urllib.error.HTTPError:
+            pass          # 服务器不支持 HEAD，下面用 Range 再问一次
         except Exception:
-            length, accept = 0, ""
+            unreachable = True
 
-        if not (length and accept == "bytes"):
+        self._content_type = ctype
+        name = self._filename_from_cd(cdisp)
+        if name and self._auto_name:
+            self.filename = name
+            self._sync_paths()
+
+        # 连都连不上，再探一次只是白等一个超时
+        if not unreachable and not (length and accept == "bytes"):
             try:
                 with _open(
                     self.effective_url,
                     self._headers({"Range": "bytes=0-0"}),
-                    self.timeout,
+                    t_probe,
                     method="GET",
                 ) as r:
                     cr = r.headers.get("Content-Range", "")
                     if cr and "/" in cr:
                         length = int(cr.split("/")[-1])
                         accept = "bytes"
+                    # HEAD 不被支持时，这里也能顺手补到类型与文件名
+                    self._content_type = self._content_type or (
+                        r.headers.get("Content-Type", "") or "").lower()
+                    if self._auto_name:
+                        n2 = self._filename_from_cd(
+                            r.headers.get("Content-Disposition", "") or "")
+                        if n2:
+                            self.filename = n2
+                            self._sync_paths()
             except Exception:
                 pass
 
@@ -143,6 +216,10 @@ class Downloader:
 
     def speed(self) -> float:
         return self._snapshot_speed()
+
+    def _explain(self, exc: Exception) -> str:
+        """把底层网络异常翻译成人话；GitHub 域名有针对性提示。"""
+        return github.describe_error(self.effective_url, exc) or str(exc)
 
     # ---------- 单块下载 ----------
     def _download_chunk(self, idx: int, start: int, end: int) -> int:
@@ -175,11 +252,13 @@ class Downloader:
                             if self.cancelled:
                                 raise Cancelled()
                 return last_end - start + 1
+            except Cancelled:
+                raise
             except Exception as e:
                 if attempt == self.retries:
                     raise DownloadError(
-                        f"分块 {idx} 下载失败（已重试 {self.retries} 次）: {e}"
-                    )
+                        f"分块 {idx} 下载失败（已重试 {self.retries} 次）："
+                        + self._explain(e))
                 time.sleep(min(2 ** attempt, 8))
         return last_end - start + 1
 
@@ -198,13 +277,28 @@ class Downloader:
                         out.write(buf)
 
     # ---------- 主流程 ----------
-    def download(self, on_progress=None) -> str:
-        os.makedirs(self.save_dir, exist_ok=True)
-        os.makedirs(self.part_dir, exist_ok=True)
-        self.filename = self._safe_name(self.filename)
+    def prepare(self) -> None:
+        """把「网页链接」解析成真实文件地址并确定文件名。
 
-        # 网盘分享链接解析（蓝奏云等）：先解析成真实直链再下载
-        if netdisk.is_supported(self.url):
+        GitHub 页面 / 蓝奏云分享页都属于这种情况：用户看到的是网页，
+        下载器要的是带 302 跳转的真实文件地址。可重复调用（幂等）。
+        """
+        if self._prepared:
+            return
+        self._prepared = True
+        if github.is_github(self.url):
+            try:
+                res = github.resolve(self.url)
+            except github.GitHubResolveError as e:
+                raise DownloadError(f"GitHub 链接解析失败：{e}")
+            if res:
+                self.effective_url = res["url"]
+                if res.get("headers"):
+                    self.extra_headers.update(res["headers"])
+                self.resolve_note = res.get("note") or ""
+                if res.get("filename") and self._auto_name:
+                    self.filename = res["filename"]
+        elif netdisk.is_supported(self.url):
             try:
                 resolved = netdisk.resolve(self.url)
             except netdisk.NetdiskResolveError as e:
@@ -212,9 +306,30 @@ class Downloader:
             if resolved:
                 self.effective_url = resolved["url"]
                 self.extra_headers = resolved.get("headers", {})
-                self.filename = self._safe_name(self._guess_filename(resolved["url"]))
+                self.resolve_note = "已解析网盘分享链接"
+                if self._auto_name:
+                    self.filename = self._guess_filename(resolved["url"])
+        self._sync_paths()
 
+    def download(self, on_progress=None) -> str:
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.prepare()
         total, ranged = self.probe()
+
+        # 网页地址不是文件：直接下一个 .html 只会让人困惑，这里明确拦下来
+        if self._content_type.startswith("text/html"):
+            low = self.filename.lower()
+            if not low.endswith((".html", ".htm")):
+                hint = ""
+                if github.is_github(self.url):
+                    hint = ("；GitHub 页面链接不能直接当文件下载，Release 请用 "
+                            "…/releases/latest 或具体资产链接，单文件请用 raw 地址")
+                raise DownloadError(
+                    f"这个地址返回的是网页（text/html），不是文件{hint}")
+
+        # 文件名可能在探测阶段被服务端改写，重新对齐路径再建临时目录
+        self._sync_paths()
+        os.makedirs(self.part_dir, exist_ok=True)
 
         if total and os.path.exists(self.filepath) and os.path.getsize(self.filepath) == total:
             if on_progress:
@@ -267,10 +382,20 @@ class Downloader:
         headers = {}
         if resume:
             headers["Range"] = f"bytes={os.path.getsize(part)}-"
-        with _open(self.effective_url, self._headers(headers), self.timeout, method="GET") as r:
+        try:
+            r = _open(self.effective_url, self._headers(headers), self.timeout,
+                      method="GET")
+        except Cancelled:
+            raise
+        except Exception as e:
+            _rmdir(self.part_dir)
+            raise DownloadError("连接失败：" + self._explain(e))
+        with r:
             cr = r.headers.get("Content-Range", "")
             if cr and "/" in cr and self.total == 0:
                 self.total = int(cr.split("/")[-1])
+            if not self.total:
+                self.total = int(r.headers.get("Content-Length", "0") or 0)
             mode = "ab" if resume else "wb"
             with open(part, mode) as f:
                 while True:
