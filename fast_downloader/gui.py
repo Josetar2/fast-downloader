@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import netdisk
 from .core import DEFAULT_THREADS, MAX_THREADS, Downloader, DownloadError
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 
 # 默认窗口尺寸：1000×600 物理像素（用户指定够用的尺寸）。
 DEFAULT_W, DEFAULT_H = 1000, 600
@@ -37,24 +37,33 @@ def _s(v):
     return max(1, int(round(v * SCALE)))
 
 
-# ---------- 简约矢量设计令牌：纯色填充 + 1px 细线，无阴影 / 无渐变 ----------
-SIDEBAR = "#F4F6F8"       # 左侧导航
-BG_MAIN = "#FAFBFC"       # 内容区底色
+# ---------- 柔和矢量设计令牌：圆角 + 低对比 + 极轻投影，不用任何图片资源 ----------
+SIDEBAR = "#FBFCFD"       # 左侧导航（几乎与内容区同色，靠明度差分层）
+BG_MAIN = "#F2F4F7"       # 内容区底色
 CARD = "#FFFFFF"          # 卡片 / 输入区
-BORDER = "#D9DEE5"        # 卡片细边框
-SEPARATOR = "#E2E6EB"     # 分隔线
-BTN_BORDER = "#C7CDD6"    # 次按钮描边
-FIELD_BORDER = "#C4CAD3"  # 输入框描边
-ACCENT = "#0F6CBD"        # Windows 风格强调蓝
-ACCENT_D = "#115EA3"
-ACCENT_SOFT = "#E7F0FA"
-TEXT = "#1B1D21"
-SUB = "#60666E"
-SUCCESS_BG = "#E4F4EA"
-SUCCESS_FG = "#177245"
-ROW_LINE = "#EDF0F3"
-TRACK = "#E5EAF0"
-FILE_TINT = "#0F6CBD"
+BORDER = "#EAEEF3"        # 卡片描边（很淡，主要靠投影分层）
+SHADOW = "#E3E8EF"        # 卡片底部 2px 投影
+SEPARATOR = "#EFF2F6"     # 分隔线
+FIELD_BG = "#F2F4F8"      # 输入框填充色（无描边，焦点时才描边）
+FIELD_HOVER = "#ECF0F5"
+FIELD_BORDER = "#D8DFE8"
+ACCENT = "#3A76E8"        # 柔和强调蓝
+ACCENT_D = "#2761CC"
+ACCENT_SOFT = "#EAF1FD"
+TEXT = "#23272E"
+LABEL = "#3F4650"      # 表单标签：比正文轻一档
+SUB = "#7C8490"
+SUCCESS_BG = "#E7F6ED"
+SUCCESS_FG = "#2C7A50"
+ROW_LINE = "#F2F5F9"
+TRACK = "#EBF0F6"
+FILE_TINT = "#3A76E8"
+
+# 圆角半径：卡片大、输入/按钮中、导航小，形成统一的柔和节奏
+CARD_R = 14
+FIELD_R = 9
+BTN_R = 9
+NAV_R = 9
 
 UI_FAM = "Segoe UI"
 FONT = ("Segoe UI", 11)
@@ -96,12 +105,38 @@ def _init_fonts(root):
     FONT_BTN = (UI_FAM, 11, "bold")
 
 
-def _box(c, x1, y1, x2, y2, fill, outline=None, width=1, tags=None):
-    """直角细线矩形：矢量风格的基本构件。"""
-    kw = {"fill": fill, "outline": outline if outline else "", "width": width}
+def _rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _mix(a, b, t):
+    """两色线性混合，用来做悬停过渡与极轻投影。"""
+    t = max(0.0, min(1.0, t))
+    pa, pb = _rgb(a), _rgb(b)
+    return "#%02X%02X%02X" % tuple(
+        int(round(x + (y - x) * t)) for x, y in zip(pa, pb))
+
+
+def _box(c, x1, y1, x2, y2, fill, outline=None, width=1, tags=None, r=0):
+    """圆角矩形：矢量风格的基本构件。r=0 退化为直角。"""
+    kw = {"fill": fill or "", "outline": outline or "", "width": width}
     if tags:
         kw["tags"] = tags
-    return c.create_rectangle(x1, y1, x2, y2, **kw)
+    r = int(r)
+    if r <= 0:
+        return c.create_rectangle(x1, y1, x2, y2, **kw)
+    r = min(r, int((x2 - x1) // 2), int((y2 - y1) // 2))
+    if r <= 0:
+        return c.create_rectangle(x1, y1, x2, y2, **kw)
+    pts = []
+    steps = 7
+    for cx, cy, a0 in ((x2 - r, y1 + r, -90), (x2 - r, y2 - r, 0),
+                       (x1 + r, y2 - r, 90), (x1 + r, y1 + r, 180)):
+        for i in range(steps + 1):
+            a = math.radians(a0 + 90.0 * i / steps)
+            pts.extend((cx + math.cos(a) * r, cy + math.sin(a) * r))
+    return c.create_polygon(pts, **kw)
 
 
 def _glyph(c, kind, x, y, color):
@@ -129,34 +164,37 @@ def _glyph(c, kind, x, y, color):
 
 
 class FlatButton(tk.Canvas):
-    """简约矢量按钮：直角细线框，主操作蓝底白字。"""
+    """柔和矢量按钮：圆角、无硬描边，悬停与按下带 60ms 颜色过渡。"""
 
-    H = 32
+    H = 34
 
     def __init__(self, parent, text, command, kind="secondary", width=100, bg=CARD):
-        self.H = _s(32)
+        self.H = _s(34)
         super().__init__(parent, width=_s(width), height=self.H, bg=bg,
                          highlightthickness=0, bd=0, takefocus=0)
         self.text, self.command, self.kind = text, command, kind
         self._bg = bg
         self._hover = False
         self._down = False
+        self._shown = None      # 当前正在显示的 (fill, fg)
+        self._job = None
         self.bind("<Enter>", lambda e: self._state(hover=True))
         self.bind("<Leave>", lambda e: self._state(hover=False, down=False))
         self.bind("<Button-1>", lambda e: self._state(down=True))
         self.bind("<ButtonRelease-1>", self._release)
-        self._draw()
+        self.configure(cursor="hand2")
+        self._animate(instant=True)
 
     def _state(self, hover=None, down=None):
         if hover is not None:
             self._hover = hover
         if down is not None:
             self._down = down
-        self._draw()
+        self._animate()
 
     def _release(self, e):
         self._down = False
-        self._draw()
+        self._animate()
         if self.command:
             self.command()
 
@@ -165,24 +203,71 @@ class FlatButton(tk.Canvas):
         w = max(_s(48), int(width))
         if abs(w - self.winfo_reqwidth()) > 1:
             self.configure(width=w)
-            self._draw()
+            self._paint()
 
-    def _draw(self):
+    def _target(self):
+        """返回 (fill, fg)；fill 为 None 表示不铺底色（文字按钮常态）。"""
+        if self.kind == "primary":
+            if self._down:
+                return (ACCENT_D, "#FFFFFF")
+            if self._hover:
+                return (_mix(ACCENT, "#FFFFFF", 0.12), "#FFFFFF")
+            return (ACCENT, "#FFFFFF")
+        if self.kind == "link":
+            if self._hover or self._down:
+                return (ACCENT_SOFT, ACCENT_D)
+            return (None, ACCENT_D)
+        if self._down:
+            return ("#DCE3EC", TEXT)
+        if self._hover:
+            return ("#E7ECF3", TEXT)
+        return ("#EFF2F7", TEXT)
+
+    def _animate(self, instant=False):
+        target = self._target()
+        if self._job:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        if instant or self._shown is None or self._shown == target:
+            self._shown = target
+            self._paint()
+            return
+        start = self._shown
+        steps, state = 4, {"i": 0}
+
+        def step():
+            state["i"] += 1
+            t = state["i"] / steps
+            fill = target[0]
+            if start[0] and target[0]:
+                fill = _mix(start[0], target[0], t)
+            self._shown = (fill, target[1])
+            self._paint()
+            if state["i"] < steps and self.winfo_exists():
+                self._job = self.after(15, step)
+            else:
+                self._shown = target
+                self._job = None
+                self._paint()
+
+        self._job = self.after(8, step)
+
+    def _paint(self):
+        if not self.winfo_exists():
+            return
         self.delete("all")
         w, h = self.winfo_reqwidth(), self.H
-        if self.kind == "primary":
-            fill = ACCENT_D if self._down else (ACCENT if not self._hover else "#2C7FD6")
-            border, fg = None, "#FFFFFF"
-        elif self.kind == "link":
-            fill = "#EDF4FC" if (self._hover or self._down) else self._bg
-            border, fg = None, ACCENT
-        else:
-            fill = "#EFF2F6" if self._down else ("#F7F9FB" if self._hover else CARD)
-            border, fg = BTN_BORDER, TEXT
-        _box(self, 0, 0, w - 1, h - 1, fill, border)
+        fill, fg = self._shown or self._target()
+        if fill:
+            _box(self, 0, 0, w, h, fill, r=BTN_R * SCALE)
         self.create_text(w / 2, h / 2 + 0.5, text=self.text, fill=fg,
                          font=FONT_BTN if self.kind == "primary" else FONT)
-        self.configure(cursor="hand2")
+
+    _draw = _paint
+
 
 
 def _make_entry(parent):
@@ -208,42 +293,78 @@ def _ui_threads(value=None) -> int:
 
 
 class Field(tk.Frame):
-    """直角细线输入框：1px 描边，内嵌无边框 Entry / Combobox。"""
+    """柔和输入框：默认浅灰填充、无描边；获得焦点时变白并浮出一圈强调色。
 
-    H = 34
+    容器是自绘 Canvas，内嵌无边框 Entry / Combobox，视觉上完全融为一体。
+    """
+
+    H = 36
 
     def __init__(self, parent, factory, width=None, bg=CARD):
-        self.H = _s(34)
+        self.H = _s(36)
         super().__init__(parent, bg=bg, height=self.H)
         if width:
             self.configure(width=_s(width))
         self.pack_propagate(False)
         self._bg = bg
         self._focus = False
+        self._hover = False
         self._cv = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
         self._cv.pack(fill="both", expand=True)
         self.inner = factory(self._cv)
         self._win = self._cv.create_window(0, 0, window=self.inner, anchor="nw")
         self.inner.bind("<FocusIn>", lambda e: self._redraw(True))
         self.inner.bind("<FocusOut>", lambda e: self._redraw(False))
+        self._cv.bind("<Enter>", lambda e: self._enter(True))
+        self._cv.bind("<Leave>", lambda e: self._enter(False))
         self.bind("<Configure>", lambda e: self._draw())
+
+    def _enter(self, flag):
+        self._hover = flag
+        self._draw()
 
     def _redraw(self, focus):
         self._focus = focus
         self._draw()
 
+    def _tint(self):
+        if self._focus:
+            return CARD
+        return FIELD_HOVER if self._hover else FIELD_BG
+
     def _draw(self):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
+        tint = self._tint()
         self._cv.delete("fieldbg")
-        line = ACCENT if self._focus else FIELD_BORDER
-        # 两层直角矩形露出 1px 描边；整体置于内容窗口之下，文字不被遮挡。
-        _box(self._cv, 0, 0, w - 1, h - 1, line, None, tags="fieldbg")
-        _box(self._cv, 1, 1, w - 2, h - 2, CARD, None, tags="fieldbg")
+        # 焦点态：先铺一圈强调色，再盖住内层，得到 1px 圆角描边
+        if self._focus:
+            _box(self._cv, 0, 0, w, h, ACCENT, r=_s(FIELD_R), tags="fieldbg")
+            _box(self._cv, 1, 1, w - 1, h - 1, CARD, r=_s(FIELD_R) - 1,
+                 tags="fieldbg")
+        else:
+            _box(self._cv, 0, 0, w, h, tint, r=_s(FIELD_R), tags="fieldbg")
         self._cv.tag_lower("fieldbg", self._win)
-        self._cv.coords(self._win, _s(6), _s(4))
-        self._cv.itemconfig(self._win, width=w - 2 * _s(6), height=h - 2 * _s(4))
+        self._cv.coords(self._win, _s(11), _s(5))
+        self._cv.itemconfig(self._win, width=max(_s(10), w - 2 * _s(11)),
+                            height=max(_s(10), h - 2 * _s(5)))
+        self._paint_inner(tint)
+
+    def _paint_inner(self, tint):
+        """让内嵌控件底色跟着容器走，圆角之外不会露出方块。"""
+        inner = self.inner
+        try:
+            if isinstance(inner, ttk.Combobox):
+                inner.configure(style="Focus.TCombobox" if self._focus
+                                else "Fill.TCombobox")
+            else:
+                inner.configure(bg=tint,
+                                insertbackground=ACCENT if self._focus else TEXT,
+                                selectbackground=ACCENT_SOFT)
+        except Exception:
+            pass
+
 
     # 代理常用方法，业务代码无需感知容器
     def get(self):
@@ -338,22 +459,24 @@ class ThinBar(tk.Canvas):
 
 
 class Card(tk.Frame):
-    """白色直角细线卡片。fit 卡片填满可用高度，内容超高时右上角浮出一
-    根细滑块，因此窗口无论缩到多小，底部按钮都不会被裁掉。"""
+    """白色圆角卡片。fit 卡片高度贴合内容（窗口太矮时收缩并浮出细滑块），
+    maxw 用来限制内容列宽，避免宽窗口下表单被拉成一条长线。"""
 
     PAD = 12
     _registry: list["Card"] = []
 
-    def __init__(self, parent, fit=False, **kw):
+    def __init__(self, parent, fit=False, maxw=0, **kw):
         super().__init__(parent, bg=BG_MAIN, **kw)
         self.PAD = _s(12)
         self._fit = fit
+        self._maxw = int(maxw)
         self._busy = False
         self._sb_on = False
         self._rechecking = False
+        self._pend = 0
         # fit 卡片不设固定高度，交给 pack(expand=True) 跟随窗口高度
         self._cv = tk.Canvas(self, bg=BG_MAIN, highlightthickness=0,
-                             borderwidth=0, height=1 if fit else 265)
+                             borderwidth=0, height=265)
         # 滑块浮在卡片上（place 覆盖），不参与布局，避免收缩/展开抖动
         self._sb = ThinBar(self._cv, command=self._cv.yview, bg=CARD)
         self._cv.configure(yscrollcommand=self._sb.set)
@@ -361,6 +484,10 @@ class Card(tk.Frame):
         self._body = tk.Frame(self._cv, bg=CARD)
         self._win = self._cv.create_window(self.PAD, self.PAD,
                                            window=self._body, anchor="nw")
+        # 四个角落遮罩：Tk 的 canvas item 盖不住 create_window 的子窗口，
+        # 只有「同级的独立控件」才能压在上面，因此用 4 个小画布还原圆角。
+        self._corners = [tk.Canvas(self, bg=CARD, highlightthickness=0,
+                                   bd=0, takefocus=0) for _ in range(4)]
         self.bind("<Configure>", self._redraw)
         self._body.bind("<Configure>", self._redraw)
         Card._registry.append(self)
@@ -375,18 +502,31 @@ class Card(tk.Frame):
             self._busy = False
 
     def _redraw_inner(self):
-        w, h = self._cv.winfo_width(), self._cv.winfo_height()
-        if w < 4 or h < 4:
+        w = self._cv.winfo_width()
+        if w < 4:
             return
         self._body.update_idletasks()
         p = self.PAD
         content_h = self._body.winfo_reqheight() + 2 * p + _s(8)
         content_w = self._body.winfo_reqwidth() + 2 * p
+        if self._fit:
+            # 高度贴合内容：窗口够高时卡片不被拉满，整页更松弛
+            avail = self.master.winfo_height()
+            want = content_h if avail <= 1 else min(content_h, avail)
+            try:
+                if abs(int(self._cv.cget("height")) - want) > 1:
+                    self._cv.configure(height=want)
+                    self.update_idletasks()
+            except Exception:
+                pass
+        h = self._cv.winfo_height()
+        if h < 4:
+            return
         need_sb = bool(self._fit and content_h > h + 2)
         if need_sb != self._sb_on:
             self._sb_on = need_sb
             if need_sb:
-                top = p + _s(8)
+                top = p + _s(CARD_R)
                 self._sb.place(in_=self._cv, relx=1.0, x=-(p + _s(11)), y=top,
                                width=_s(10),
                                height=max(_s(20), h - top - p))
@@ -397,24 +537,83 @@ class Card(tk.Frame):
             else:
                 self._sb.place_forget()
         elif need_sb:
-            top = p + _s(8)
+            top = p + _s(CARD_R)
             self._sb.place_configure(in_=self._cv, relx=1.0, x=-(p + _s(11)),
                                      y=top, width=_s(10),
                                      height=max(_s(20), h - top - p))
         # create_window 生成的内容窗口也是 canvas item，delete("all") 会连它一起删，
         # 导致卡片内表单消失；这里只删背景 tag。
         self._cv.delete("cardbg")
-        _box(self._cv, p, p, w - p, h - p, CARD, BORDER, 1, tags="cardbg")
+        r = _s(CARD_R)
+        # 先铺 2px 下坠的极淡投影，再压上白色圆角卡片，得到"浮起"的柔和层次
+        _box(self._cv, p, p + _s(2), w - p, h - p + _s(2), SHADOW, r=r,
+             tags="cardbg")
+        _box(self._cv, p, p, w - p, h - p, CARD, BORDER, 1, r=r, tags="cardbg")
+        # 内嵌内容窗口是直角的，会盖住圆角：用四个角落小画布把它遮回圆角
+        size = r + 2
+        for cw, quad in zip(self._corners, ("nw", "ne", "sw", "se")):
+            cx = p if quad in ("nw", "sw") else w - p - size
+            cy = p if quad in ("nw", "ne") else h - p - size
+            cw.place(in_=self._cv, x=cx, y=cy, width=size, height=size)
+            self._paint_corner(cw, r, quad)
         self._cv.tag_lower("cardbg", self._win)
-        self._cv.coords(self._win, p, p)
-        self._cv.itemconfig(self._win, width=max(_s(40), w - 2 * p))
+
+        inner_w = max(_s(40), w - 2 * p)
+        if self._maxw:
+            inner_w = min(inner_w, self._maxw)
+        self._cv.coords(self._win, p + max(0, (w - 2 * p - inner_w) // 2), p)
+        self._cv.itemconfig(self._win, width=inner_w)
         self._cv.itemconfig(self._win, height=(
             self._body.winfo_reqheight() if self._fit else max(_s(40), h - 2 * p)))
+        # 内容窗口的宽度要晚一拍才落到 Frame 上：补一拍重绘让列宽收敛，
+        # 最多补两次，避免尺寸抖动时陷入无限重绘。
+        if abs(self._body.winfo_width() - inner_w) > 1:
+            if self._pend < 2:
+                self._pend += 1
+                self.after(1, self._pending_redraw)
+        else:
+            self._pend = 0
         self._cv.configure(scrollregion=(0, 0, max(w, content_w),
                                          max(h, content_h)))
         if self._sb_on:
             # ThinBar 本身是 Canvas，.lift() 会落到 tag_raise 上，这里直接 raise 窗口
             self._sb.tk.call("raise", self._sb._w)
+
+    @staticmethod
+    def _paint_corner(cw, r, quad):
+        """在小方块的角落画出「圆角外侧的月牙」，用来盖住直角内容窗口的角。"""
+        cw.delete("all")
+        # 角点 P、圆心 C、两条边的方向向量（局部坐标，方块尺寸 r+2）
+        P, C, u1, u2 = {
+            "nw": ((0, 0), (r, r), (0, -1), (-1, 0)),
+            "ne": ((r, 0), (0, r), (0, -1), (1, 0)),
+            "sw": ((0, r), (r, 0), (0, 1), (-1, 0)),
+            "se": ((r, r), (0, 0), (0, 1), (1, 0)),
+        }[quad]
+        cx, cy = C
+        t1 = (cx + u1[0] * r, cy + u1[1] * r)
+        t2 = (cx + u2[0] * r, cy + u2[1] * r)
+        a1 = math.atan2(t1[1] - cy, t1[0] - cx)
+        a2 = math.atan2(t2[1] - cy, t2[0] - cx)
+        d = a2 - a1
+        while d > math.pi:
+            d -= 2 * math.pi
+        while d < -math.pi:
+            d += 2 * math.pi
+        steps = 9
+        arc = []
+        for i in range(steps + 1):
+            a = a1 + d * i / steps
+            arc.append((cx + math.cos(a) * r, cy + math.sin(a) * r))
+        pts = [P] + arc
+        flat = [v for pt in pts for v in pt]
+        cw.create_polygon(flat, fill=BG_MAIN, outline="")
+        cw.create_line([v for pt in arc for v in pt], fill=BORDER, width=1,
+                       smooth=True)
+
+    def _pending_redraw(self):
+        self._pend = 0
+        self._redraw()
 
     def _recheck(self):
         self._rechecking = False
@@ -444,18 +643,20 @@ class Card(tk.Frame):
 
 
 class NavItem(tk.Canvas):
-    """简约矢量导航项：选中时蓝色左侧竖条 + 浅蓝底，直角无阴影。"""
+    """柔和导航项：选中时一整块圆角浅蓝底 + 强调色文字，无竖条无描边。"""
 
-    H = 36
+    H = 38
 
     def __init__(self, parent, app, name, glyph, width):
-        self.H = _s(36)
+        self.H = _s(38)
         super().__init__(parent, width=width, height=self.H, bg=SIDEBAR,
                          highlightthickness=0, bd=0, takefocus=0)
         self.app, self.name, self.glyph = app, name, glyph
         self._sel = False
         self._hover = False
         self._compact = False
+        self._shown = None
+        self._job = None
         self.bind("<Configure>", lambda e: self._draw())
         self.bind("<Enter>", lambda e: self._set(hover=True))
         self.bind("<Leave>", lambda e: self._set(hover=False))
@@ -467,16 +668,56 @@ class NavItem(tk.Canvas):
             self._sel = selected
         if hover is not None:
             self._hover = hover
-        self._draw()
+        self._animate()
+
+    def _target(self):
+        if self._sel:
+            return ACCENT_SOFT
+        if self._hover:
+            return "#EFF3F8"
+        return None
+
+    def _animate(self):
+        target = self._target()
+        if self._job:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        start = self._shown
+        if start == target:
+            return
+        steps, state = 4, {"i": 0}
+
+        def step():
+            state["i"] += 1
+            t = state["i"] / steps
+            if start and target:
+                self._shown = _mix(start, target, t)
+            elif target is None:
+                # 淡出：从当前色过渡到侧栏底色，肉眼看起来像渐隐
+                self._shown = _mix(start, SIDEBAR, t) if start else None
+            else:
+                self._shown = _mix(SIDEBAR, target, t) if not start else target
+            self._draw()
+            if state["i"] < steps and self.winfo_exists():
+                self._job = self.after(15, step)
+            else:
+                self._shown = target
+                self._job = None
+                self._draw()
+
+        self._job = self.after(8, step)
 
     def set_compact(self, flag):
         flag = bool(flag)
         if flag != self._compact:
             self._compact = flag
-            self.H = _s(30) if flag else _s(36)
+            self.H = _s(32) if flag else _s(38)
             self.configure(height=self.H)
             try:
-                self.pack_configure(pady=1 if flag else 2)
+                self.pack_configure(pady=_s(2) if flag else _s(3))
             except Exception:
                 pass
             self._draw()
@@ -486,21 +727,17 @@ class NavItem(tk.Canvas):
         w = self.winfo_width()
         if w < 20:
             return
-        if self._sel:
-            fill = ACCENT_SOFT
-        elif self._hover:
-            fill = "#EAEDF1"
-        else:
-            fill = SIDEBAR
-        _box(self, 0, 0, w, self.H, fill)
-        if self._sel:
-            _box(self, 0, 0, max(2, _s(3)), self.H, ACCENT)
-        ink = ACCENT_D if self._sel else "#5B6068"
+        h = self.H
+        pad = _s(4)
+        fill = self._shown
+        if fill:
+            _box(self, pad, _s(1), w - pad, h - _s(1), fill, r=_s(NAV_R))
+        ink = ACCENT_D if self._sel else "#5C636E"
         if self._compact:
-            _glyph(self, self.glyph, w / 2, self.H / 2, ink)
+            _glyph(self, self.glyph, w / 2, h / 2, ink)
         else:
-            _glyph(self, self.glyph, _s(22), self.H / 2, ink)
-            self.create_text(_s(42), self.H / 2 + 0.5, text=self.name, anchor="w",
+            _glyph(self, self.glyph, _s(26), h / 2, ink)
+            self.create_text(_s(46), h / 2 + 0.5, text=self.name, anchor="w",
                              fill=ACCENT_D if self._sel else TEXT,
                              font=(UI_FAM, 12, "bold" if self._sel else "normal"))
 
@@ -523,6 +760,34 @@ def _fmt_time(s: float) -> str:
     if s < 3600:
         return f"{s // 60}m{s % 60:02d}s"
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+_ELIDE_FONTS = {}
+
+
+def _elide(text, maxw, font):
+    """按像素宽度截断并补省略号，避免文件名被硬切成半截。"""
+    if maxw <= 8 or not text:
+        return text
+    key = tuple(font)
+    f = _ELIDE_FONTS.get(key)
+    if f is None:
+        try:
+            import tkinter.font as tkfont
+            f = tkfont.Font(font=font)
+        except Exception:
+            return text
+        _ELIDE_FONTS[key] = f
+    if f.measure(text) <= maxw:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if f.measure(text[:mid] + "…") <= maxw:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "…"
 
 
 def _icon_color(name: str) -> str:
@@ -652,32 +917,44 @@ class TaskRow(tk.Frame):
         self._mode = None
         self.bind("<Configure>", self._adapt)
 
-        self.icon = tk.Canvas(self, width=30, height=32, bg=CARD, highlightthickness=0)
-        self.icon.grid(row=0, column=0, padx=(4, 12), pady=8)
+        self.icon = tk.Canvas(self, width=_s(32), height=_s(34), bg=CARD,
+                              highlightthickness=0)
+        self.icon.grid(row=0, column=0, padx=(_s(4), _s(12)), pady=_s(8))
 
-        self.name = tk.Label(self, text="", bg=CARD, fg=TEXT, font=FONT, anchor="w")
-        self.name.grid(row=0, column=1, sticky="w", pady=(8, 0))
+        # width=1：把请求宽度压到最小，余量全部由列权重给文件名列，
+        # 这样每行的状态/进度/操作列都精确对齐，不会随文件名长短左右晃
+        self.name = tk.Label(self, text="", bg=CARD, fg=LABEL, font=FONT,
+                             anchor="w", width=1)
+        self.name.grid(row=0, column=1, sticky="we", pady=(_s(8), 0))
+        self.name.bind("<Configure>", self._fit_name)
+        self._full_name = ""
 
-        self.stat = tk.Canvas(self, width=64, height=22, bg=CARD, highlightthickness=0)
-        self.stat.grid(row=0, column=2, padx=(10, 0), pady=8)
+        self.stat = tk.Canvas(self, width=_s(66), height=_s(24), bg=CARD,
+                              highlightthickness=0)
+        self.stat.grid(row=0, column=2, padx=(_s(10), 0), pady=_s(8))
 
-        self.pbar = tk.Canvas(self, width=104, height=8, bg=CARD, highlightthickness=0)
-        self.pbar.grid(row=0, column=3, padx=(12, 0), pady=8)
+        self.pbar = tk.Canvas(self, width=_s(104), height=_s(8), bg=CARD,
+                              highlightthickness=0)
+        self.pbar.grid(row=0, column=3, padx=(_s(12), 0), pady=_s(8))
 
-        self.pct = tk.Label(self, text="", bg=CARD, fg=SUB, font=FONT_XS, width=5, anchor="w")
-        self.pct.grid(row=0, column=4, padx=(6, 0), pady=8)
+        self.pct = tk.Label(self, text="", bg=CARD, fg=SUB, font=FONT_XS,
+                            width=5, anchor="w")
+        self.pct.grid(row=0, column=4, padx=(_s(6), 0), pady=_s(8))
 
         self.meta = tk.Label(self, text="", bg=CARD, fg=SUB, font=FONT_SM,
                              width=24, anchor="w")
-        self.meta.grid(row=0, column=5, padx=(10, 0), pady=8)
+        self.meta.grid(row=0, column=5, padx=(_s(10), 0), pady=_s(8))
 
+        # 固定宽度：没任务可取消时空着也不让整行列宽跳动
         self.act = tk.Label(self, text="取消", bg=CARD, fg=ACCENT, font=FONT_SM,
-                            cursor="hand2")
-        self.act.grid(row=0, column=6, padx=(10, 8), pady=8)
+                            cursor="hand2", width=4, anchor="e")
+        self.act.grid(row=0, column=6, padx=(_s(10), _s(8)), pady=_s(8))
         self.act.bind("<Button-1>", lambda e: self.on_action("cancel", self.task))
+        self.act.bind("<Enter>", lambda e: self.act.configure(fg=ACCENT_D))
+        self.act.bind("<Leave>", lambda e: self.act.configure(fg=ACCENT))
 
         sep = tk.Frame(self, bg=ROW_LINE, height=1)
-        sep.grid(row=1, column=0, columnspan=7, sticky="ew", padx=4)
+        sep.grid(row=1, column=0, columnspan=7, sticky="ew", padx=_s(14))
 
     def _adapt(self, e=None):
         """窗口变窄时按可用宽度收起次要信息列，主文件名永远占满剩余空间。"""
@@ -688,43 +965,56 @@ class TaskRow(tk.Frame):
         if mode == self._mode:
             return
         self._mode = mode
+        # 进度条是最关键的信息，中等宽度也要留着；只有极窄时才只保留状态与文件名
         for widget, visible in ((self.meta, mode == 0),
-                                (self.pbar, mode == 0),
-                                (self.pct, mode == 0),
+                                (self.pbar, mode <= 1),
+                                (self.pct, mode <= 1),
                                 (self.stat, True)):
             if visible:
                 widget.grid()
             else:
                 widget.grid_remove()
-        reserve = _s(380) if mode == 0 else (_s(230) if mode == 1 else _s(150))
-        self.name.configure(wraplength=max(_s(70), w - reserve))
+        self._fit_name()
+
+    def _fit_name(self, e=None):
+        w = e.width if e is not None else self.name.winfo_width()
+        self.name.config(text=_elide(self._full_name, max(0, w - _s(2)), FONT))
 
     def update(self, t: Task, first=False):
         self.task = t
-        self.name.config(text=t.filename or t.url)
+        self._full_name = t.filename or t.url
+        self._fit_name()
         color = _icon_color(t.filename or t.url)
         self.icon.delete("all")
-        # 矢量线框文件图标：细线矩形 + 折角 + 文本线
-        self.icon.create_rectangle(4, 3, 25, 29, outline=color, width=2)
-        self.icon.create_line(18, 3, 18, 10, 25, 10, fill=color, width=2)
-        self.icon.create_line(9, 15, 20, 15, fill=color, width=2)
-        self.icon.create_line(9, 20, 20, 20, fill=color, width=2)
-        self.icon.create_line(9, 25, 17, 25, fill=color, width=2)
+        # 圆角色块 + 细线文档：比纯线框更有分量，也不至于花哨
+        _box(self.icon, _s(2), _s(2), _s(30), _s(32),
+             _mix(color, "#FFFFFF", 0.86), r=_s(9))
+        self.icon.create_rectangle(_s(10), _s(10), _s(22), _s(25),
+                                   outline=color, width=max(1, _s(1.4)))
+        self.icon.create_line(_s(17), _s(10), _s(17), _s(14), _s(22), _s(14),
+                              fill=color, width=max(1, _s(1.4)),
+                              joinstyle="round")
+        self.icon.create_line(_s(12), _s(18), _s(20), _s(18), fill=color,
+                              width=max(1, _s(1.2)), capstyle="round")
+        self.icon.create_line(_s(12), _s(21), _s(18), _s(21), fill=color,
+                              width=max(1, _s(1.2)), capstyle="round")
 
         self.stat.delete("all")
         label, bg, fg = {
             "已完成": ("已完成", SUCCESS_BG, SUCCESS_FG),
             "下载中": ("下载中", ACCENT_SOFT, ACCENT_D),
-            "排队中": ("排队中", "#EFEFF3", SUB),
-        }.get(t.status, (t.status, "#FFE8E7", "#D4443C"))
-        _box(self.stat, 0, 0, 63, 21, bg)
-        self.stat.create_text(32, 11, text=label, fill=fg, font=FONT_XS)
+            "排队中": ("排队中", "#F1F3F7", SUB),
+        }.get(t.status, (t.status, "#FDEDEC", "#C94A42"))
+        h = _s(24)
+        _box(self.stat, 0, _s(1), _s(66), h - _s(1), bg, r=h // 2 - 1)
+        self.stat.create_text(_s(33), h / 2, text=label, fill=fg, font=FONT_XS)
 
         self.pbar.delete("all")
         pct = (t.downloaded / t.total * 100) if t.total else 0
-        _box(self.pbar, 0, 0, 103, 7, TRACK)
+        w, bh = _s(104), _s(8)
+        _box(self.pbar, 0, 0, w, bh, TRACK, r=bh // 2)
         if pct > 0:
-            _box(self.pbar, 0, 0, max(4, 103 * pct / 100), 7, ACCENT)
+            _box(self.pbar, 0, 0, max(bh, w * pct / 100), bh, ACCENT, r=bh // 2)
         self.pct.config(text=f"{pct:.0f}%" if pct else "")
 
         if t.status == "下载中":
@@ -927,17 +1217,20 @@ class App(tk.Tk):
             self._side_head.pack_configure(
                 padx=0 if compact else _s(16),
                 pady=(_s(6), _s(6)) if compact else (_s(20), _s(16)))
-            self._side_ic.pack_configure(anchor="center" if compact else "n",
-                                         padx=0 if compact else (0, _s(10)))
+            # 紧凑档侧栏只剩图标：图标块要水平居中，否则会贴在左上角
+            self._side_ic.pack_configure(
+                side="top" if compact else "left",
+                anchor="center" if compact else "n",
+                padx=0 if compact else (0, _s(10)))
             self._nav_wrap.pack_configure(padx=_s(6) if compact else _s(10))
         except Exception:
             pass
 
     def _apply_mode(self, mode):
         compact, mini = mode > 0, mode == 2
-        pad = CARD_PAD if mode == 0 else (_s(9) if mode == 1 else _s(6))
+        pad = CARD_PAD if mode == 0 else (_s(8) if mode == 1 else _s(6))
         body_pad = PADX if mode == 0 else (_s(14) if mode == 1 else _s(8))
-        py = PADY if mode == 0 else (_s(7) if mode == 1 else _s(4))
+        py = PADY if mode == 0 else (_s(5) if mode == 1 else _s(4))
         if compact != self._compact:
             self._compact = compact
             self._set_sidebar_compact(compact)
@@ -963,7 +1256,7 @@ class App(tk.Tk):
         for opts in (self._new_pady, self._set_pady):
             for w, orig in opts.items():
                 try:
-                    w.grid_configure(pady=(_s(2) if compact else orig))
+                    w.grid_configure(pady=(_s(1) if compact else orig))
                 except Exception:
                     pass
         # 极简模式：只保留「链接 + 开始下载」，其余字段与次要按钮收起
@@ -1075,9 +1368,30 @@ class App(tk.Tk):
                     padding=4, font=FONT)
         s.map("Plain.TCombobox", fieldbackground=[("readonly", "#FFFFFF")],
               bordercolor=[("readonly", "#FFFFFF")])
-        s.configure("TScrollbar", background=BTN_BORDER, troughcolor=CARD,
+        # 输入框未聚焦时的浅灰填充：ttk 只能靠样式切换，与 tk.Entry 的 bg 保持一致
+        s.configure("Fill.TCombobox", fieldbackground=FIELD_BG, foreground=TEXT,
+                    background=FIELD_BG, bordercolor=FIELD_BG,
+                    lightcolor=FIELD_BG, darkcolor=FIELD_BG,
+                    arrowcolor=SUB, borderwidth=0, relief="flat",
+                    padding=4, font=FONT)
+        s.map("Fill.TCombobox", fieldbackground=[("readonly", FIELD_BG),
+                                                 ("!readonly", FIELD_BG)],
+              background=[("readonly", FIELD_BG), ("!readonly", FIELD_BG)],
+              bordercolor=[("readonly", FIELD_BG)],
+              lightcolor=[("readonly", FIELD_BG)],
+              darkcolor=[("readonly", FIELD_BG)])
+        s.configure("Focus.TCombobox", fieldbackground="#FFFFFF", foreground=TEXT,
+                    background="#FFFFFF", bordercolor="#FFFFFF",
+                    lightcolor="#FFFFFF", darkcolor="#FFFFFF",
+                    arrowcolor=SUB, borderwidth=0, relief="flat",
+                    padding=4, font=FONT)
+        s.map("Focus.TCombobox", fieldbackground=[("readonly", "#FFFFFF"),
+                                                  ("!readonly", "#FFFFFF")],
+              background=[("readonly", "#FFFFFF"), ("!readonly", "#FFFFFF")])
+
+        s.configure("TScrollbar", background=FIELD_BORDER, troughcolor=CARD,
                     bordercolor=CARD, arrowcolor=SUB, relief="flat", width=10)
-        s.configure("Vertical.TScrollbar", background=BTN_BORDER, troughcolor=CARD,
+        s.configure("Vertical.TScrollbar", background=FIELD_BORDER, troughcolor=CARD,
                     bordercolor=CARD, arrowcolor=SUB, relief="flat")
 
     # ---------- 侧边栏 ----------
@@ -1106,20 +1420,20 @@ class App(tk.Tk):
             relx=1.0, y=0, relheight=1, anchor="ne")
 
         head = tk.Frame(side, bg=SIDEBAR)
-        head.pack(fill="x", padx=_s(16), pady=(_s(20), _s(16)))
-        ic = tk.Canvas(head, width=_s(38), height=_s(38), bg=SIDEBAR, highlightthickness=0)
-        ic.pack(side="left", anchor="n", padx=(0, _s(10)))
+        head.pack(fill="x", padx=_s(16), pady=(_s(20), _s(18)))
+        ic = tk.Canvas(head, width=_s(40), height=_s(40), bg=SIDEBAR,
+                       highlightthickness=0)
+        ic.pack(side="left", anchor="n", padx=(0, _s(11)))
         self._side_head, self._side_ic = head, ic
-        # 矢量线框下载图标：细线方框 + 向下箭头 + 托盘
-        ic.create_rectangle(_s(3), _s(3), _s(35), _s(35),
-                            outline=FILE_TINT, width=max(2, _s(2)))
-        ic.create_line(_s(19), _s(9), _s(19), _s(24), fill=FILE_TINT,
-                       width=max(2, _s(2.4)), capstyle="round")
-        ic.create_line(_s(12), _s(17), _s(19), _s(24), _s(26), _s(17),
-                       fill=FILE_TINT, width=max(2, _s(2.4)),
+        # 圆角蓝色图标块 + 白色下载箭头：比线框方框更柔和、更像成品软件
+        _box(ic, 0, 0, _s(40), _s(40), ACCENT, r=_s(11))
+        ic.create_line(_s(20), _s(9), _s(20), _s(24), fill="#FFFFFF",
+                       width=max(2, _s(2.6)), capstyle="round")
+        ic.create_line(_s(13), _s(17), _s(20), _s(24), _s(27), _s(17),
+                       fill="#FFFFFF", width=max(2, _s(2.6)),
                        capstyle="round", joinstyle="round")
-        ic.create_line(_s(11), _s(29), _s(27), _s(29), fill=FILE_TINT,
-                       width=max(2, _s(2.4)), capstyle="round")
+        ic.create_line(_s(12), _s(30), _s(28), _s(30), fill="#FFFFFF",
+                       width=max(2, _s(2.6)), capstyle="round")
 
         txt = tk.Frame(head, bg=SIDEBAR)
         txt.pack(side="left", fill="x")
@@ -1127,10 +1441,10 @@ class App(tk.Tk):
         tk.Label(txt, text="高速下载器", bg=SIDEBAR, fg=TEXT,
                  font=(UI_FAM, 14, "bold"), anchor="w").pack(anchor="w", pady=(1, 0))
         tk.Label(txt, text="Fast Downloader", bg=SIDEBAR, fg=SUB,
-                 font=FONT_XS, anchor="w").pack(anchor="w", pady=(2, 0))
+                 font=FONT_XS, anchor="w").pack(anchor="w", pady=(3, 0))
 
         sep = tk.Frame(side, bg=SEPARATOR, height=1)
-        sep.pack(fill="x", padx=_s(16), pady=(0, _s(12)))
+        sep.pack(fill="x", padx=_s(18), pady=(0, _s(14)))
         self._side_sep = sep
 
         nav_wrap = tk.Frame(side, bg=SIDEBAR)
@@ -1138,7 +1452,7 @@ class App(tk.Tk):
         self._nav_wrap = nav_wrap
         for name, glyph in items:
             item = NavItem(nav_wrap, self, name, glyph, width - 20)
-            item.pack(fill="x", pady=2)
+            item.pack(fill="x", pady=_s(3))
             self._nav[name] = item
 
         ver = tk.Label(side, text=f"v{APP_VERSION}", bg=SIDEBAR, fg=SUB,
@@ -1167,16 +1481,16 @@ class App(tk.Tk):
     def _build_new(self):
         wrap = tk.Frame(self.content, bg=BG_MAIN)
         self._panels["新建下载"] = wrap
-        card = Card(wrap, fit=True)
-        card.pack(fill="both", expand=True)
+        card = Card(wrap, fit=True, maxw=_s(700))
+        card.pack(fill="x")
         body = card._body
         self._new_title = tk.Label(body, text="新建下载任务", bg=CARD, fg=TEXT,
                                    font=FONT_T)
-        self._new_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._new_title.pack(anchor="w", padx=PADX, pady=(PADY, _s(6)))
         self._new_sub = tk.Label(
             body, text="粘贴直链或网盘分享链接，支持分块并发与断点续传",
             bg=CARD, fg=SUB, font=FONT_SM)
-        self._new_sub.pack(anchor="w", padx=PADX, pady=(0, _s(14)))
+        self._new_sub.pack(anchor="w", padx=PADX, pady=(0, _s(18)))
         self._new_body = body
 
         f = tk.Frame(body, bg=CARD)
@@ -1186,7 +1500,7 @@ class App(tk.Tk):
 
         url_label = tk.Label(f, text="下载链接", bg=CARD, fg=TEXT, font=FONT,
                              anchor="w")
-        url_label.grid(row=0, column=0, sticky="w", pady=(4, 4))
+        url_label.grid(row=0, column=0, sticky="w", pady=(_s(2), _s(6)))
         row0 = tk.Frame(f, bg=CARD)
         row0.grid(row=1, column=0, columnspan=3, sticky="ew", pady=2)
         row0.columnconfigure(0, weight=1)
@@ -1198,7 +1512,7 @@ class App(tk.Tk):
 
         save_label = tk.Label(f, text="保存位置", bg=CARD, fg=TEXT, font=FONT,
                               anchor="w")
-        save_label.grid(row=2, column=0, sticky="w", pady=(_s(14), 4))
+        save_label.grid(row=2, column=0, sticky="w", pady=(_s(16), _s(6)))
         row1 = tk.Frame(f, bg=CARD)
         row1.grid(row=3, column=0, columnspan=3, sticky="ew", pady=2)
         row1.columnconfigure(0, weight=1)
@@ -1211,7 +1525,7 @@ class App(tk.Tk):
 
         name_label = tk.Label(f, text="文件名（留空自动）", bg=CARD, fg=TEXT,
                               font=FONT, anchor="w")
-        name_label.grid(row=4, column=0, sticky="w", pady=(_s(14), 4))
+        name_label.grid(row=4, column=0, sticky="w", pady=(_s(16), _s(6)))
         rown = tk.Frame(f, bg=CARD)
         rown.grid(row=5, column=0, columnspan=3, sticky="ew", pady=2)
         rown.columnconfigure(0, weight=1)
@@ -1223,8 +1537,8 @@ class App(tk.Tk):
         # 卡片底部被挤出可视区，右侧常驻细滚动条。
         threads_label = tk.Label(
             f, text=f"线程数（默认 {DEFAULT_THREADS}，最高 {MAX_THREADS}）",
-            bg=CARD, fg=TEXT, font=FONT, anchor="w")
-        threads_label.grid(row=6, column=0, sticky="w", pady=(_s(14), 4))
+            bg=CARD, fg=LABEL, font=FONT, anchor="w")
+        threads_label.grid(row=6, column=0, sticky="w", pady=(_s(16), _s(6)))
         self.threads_e = Field(f, lambda c: _make_combo(
             c, THREAD_CHOICES, str(DEFAULT_THREADS)),
             width=116)
@@ -1234,11 +1548,11 @@ class App(tk.Tk):
         self.new_info = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SM,
                                  anchor="w")
         self.new_info.grid(row=8, column=0, columnspan=3, sticky="w",
-                           pady=(_s(12), 4))
+                           pady=(_s(14), _s(2)))
         self._new_info = self.new_info
 
         btns = tk.Frame(f, bg=CARD)
-        btns.grid(row=9, column=0, columnspan=3, sticky="w", pady=(_s(8), 0))
+        btns.grid(row=9, column=0, columnspan=3, sticky="w", pady=(_s(14), 0))
         self._start_btn = FlatButton(btns, "开始下载", self._add_task,
                                     kind="primary", width=120, bg=CARD)
         self._start_btn.pack(side="left", padx=(0, _s(10)))
@@ -1309,10 +1623,10 @@ class App(tk.Tk):
         body = card._body
         self._tasks_title = tk.Label(body, text="任务列表", bg=CARD, fg=TEXT,
                                      font=FONT_T)
-        self._tasks_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._tasks_title.pack(anchor="w", padx=PADX, pady=(PADY, _s(6)))
         self._tasks_sub = tk.Label(body, text="正在下载与排队中的任务", bg=CARD,
                                    fg=SUB, font=FONT_SM)
-        self._tasks_sub.pack(anchor="w", padx=PADX, pady=(0, _s(10)))
+        self._tasks_sub.pack(anchor="w", padx=PADX, pady=(0, _s(12)))
         self.tasks_list = TaskList(body, self.mgr, self._on_task_action)
         self.tasks_list.pack(fill="both", expand=True, padx=_s(14), pady=(0, _s(14)))
 
@@ -1332,10 +1646,10 @@ class App(tk.Tk):
         body = card._body
         self._done_title = tk.Label(body, text="完成记录", bg=CARD, fg=TEXT,
                                     font=FONT_T)
-        self._done_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._done_title.pack(anchor="w", padx=PADX, pady=(PADY, _s(6)))
         self._done_sub = tk.Label(body, text="已结束的全部任务", bg=CARD, fg=SUB,
                                   font=FONT_SM)
-        self._done_sub.pack(anchor="w", padx=PADX, pady=(0, _s(10)))
+        self._done_sub.pack(anchor="w", padx=PADX, pady=(0, _s(12)))
         self.done_list = TaskList(body, self.mgr, lambda a, t: None)
         self.done_list.pack(fill="both", expand=True, padx=_s(14), pady=(0, _s(14)))
 
@@ -1343,33 +1657,41 @@ class App(tk.Tk):
     def _build_settings(self):
         wrap = tk.Frame(self.content, bg=BG_MAIN)
         self._panels["设置"] = wrap
-        card = Card(wrap, fit=True)
-        card.pack(fill="both", expand=True)
+        card = Card(wrap, fit=True, maxw=_s(700))
+        card.pack(fill="x")
         body = card._body
         self._set_title = tk.Label(body, text="设置", bg=CARD, fg=TEXT,
                                    font=FONT_T)
-        self._set_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._set_title.pack(anchor="w", padx=PADX, pady=(PADY, _s(6)))
         self._set_sub = tk.Label(body, text="调整并发与默认下载参数", bg=CARD,
                                  fg=SUB, font=FONT_SM)
-        self._set_sub.pack(anchor="w", padx=PADX, pady=(0, _s(14)))
+        self._set_sub.pack(anchor="w", padx=PADX, pady=(0, _s(16)))
         f = tk.Frame(body, bg=CARD)
         f.pack(fill="x", padx=PADX, pady=(0, PADY))
-        f.columnconfigure(0, minsize=_s(150))
+        # 两列式：左侧标签列定宽，右侧控件列吃掉余量，所有行自然对齐
+        f.columnconfigure(0, minsize=_s(132))
         f.columnconfigure(1, weight=1)
         self._set_form = f
 
-        tk.Label(f, text="最大同时下载数", bg=CARD, fg=TEXT,
-                 font=FONT).grid(row=0, column=0, sticky="w", pady=_s(9))
+        def label(text, row):
+            w = tk.Label(f, text=text, bg=CARD, fg=LABEL, font=FONT, anchor="w")
+            w.grid(row=row, column=0, sticky="w", pady=_s(10))
+            return w
+
+        l_max = label("最大同时下载数", 0)
         self.max_e = Field(f, lambda c: _make_combo(
             c, [str(i) for i in range(1, 11)], str(self.mgr.max_concurrent)),
             width=116)
-        self.max_e.grid(row=0, column=1, sticky="w", pady=_s(9))
+        self.max_e.grid(row=0, column=1, sticky="w", pady=_s(10))
 
-        save_label = tk.Label(f, text="默认保存位置", bg=CARD, fg=TEXT,
-                              font=FONT)
-        save_label.grid(row=1, column=0, sticky="w", pady=(_s(14), 5))
+        l_threads = label("默认线程数", 1)
+        self.def_threads_e = Field(f, lambda c: _make_combo(
+            c, THREAD_CHOICES, str(DEFAULT_THREADS)), width=116)
+        self.def_threads_e.grid(row=1, column=1, sticky="w", pady=_s(10))
+
+        l_save = label("默认保存位置", 2)
         row = tk.Frame(f, bg=CARD)
-        row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=2)
+        row.grid(row=2, column=1, sticky="ew", pady=_s(10))
         row.columnconfigure(0, weight=1)
         self.def_save_e = Field(row, _make_entry)
         self.def_save_e.insert(0, os.path.join(os.path.expanduser("~"), "Desktop"))
@@ -1378,18 +1700,10 @@ class App(tk.Tk):
                                          width=88, bg=CARD)
         self._choose_def_btn.grid(row=0, column=1, padx=(_s(8), 0))
 
-        threads_label = tk.Label(f, text="默认线程数", bg=CARD, fg=TEXT,
-                                 font=FONT)
-        threads_label.grid(row=3, column=0, sticky="w", pady=(_s(14), 5))
-        self.def_threads_e = Field(f, lambda c: _make_combo(
-            c, THREAD_CHOICES, str(DEFAULT_THREADS)),
-            width=116)
-        self.def_threads_e.grid(row=3, column=1, sticky="w", pady=5)
-
         FlatButton(f, "保存设置", self._save_settings, kind="primary",
-                  width=112, bg=CARD).grid(row=4, column=0, sticky="w",
-                                           pady=(_s(20), 0))
-        self._set_optional = [save_label, row, threads_label, self.def_threads_e]
+                   width=112, bg=CARD).grid(row=3, column=0, columnspan=2,
+                                            sticky="w", pady=(_s(22), 0))
+        self._set_optional = [l_save, row, l_threads, self.def_threads_e]
         self._set_pady = {w: w.grid_info().get("pady", "0") for w in f.grid_slaves()}
 
     def _choose_def(self):
