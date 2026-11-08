@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("url", help="下载地址")
     p.add_argument("-o", "--output", default=".", help="保存目录（默认当前目录）")
     p.add_argument("-n", "--name", default=None, help="文件名（默认从 URL 推断）")
-    p.add_argument("-t", "--threads", type=int, default=8, help="线程数（默认 8）")
+    p.add_argument("-t", "--threads", type=int, default=16, help="线程数（默认 16，最大）")
     args = p.parse_args(argv)
 
     dl = Downloader(args.url, args.output, filename=args.name, threads=args.threads)

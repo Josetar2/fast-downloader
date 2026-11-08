@@ -4,7 +4,7 @@
 
 ## 特性
 
-- 多线程分块下载（基于 HTTP `Range`）
+- 多线程分块下载（基于 HTTP `Range`），**默认使用最大 16 线程**，可在界面 / 命令行调整
 - 服务器不支持分块时自动降级为单线程流式下载
 - 断点续传：中断后重跑会复用已下载的分块
 - 实时进度 / 速度显示
@@ -14,6 +14,8 @@
 - 支持蓝奏云等「直链型网盘」分享链接自动解析下载（粘贴分享页链接即可，自动提取真实直链）
 - 现代扁平图标（蓝渐变圆角方块 + 下载箭头），纯标准库生成，已内嵌至 exe
 - **macOS 风格界面**：无边框圆角窗口 + 红黄绿交通灯、浅灰侧栏、圆角胶囊导航、白色圆角卡片与蓝色圆角按钮，主色 `#007AFF`
+- **三档响应式布局**：窗口可从最大化一路缩到约一张身份证大小（最小 320×210 逻辑像素），内部 UI 随窗口连续重排。宽屏显示完整表单；中等宽度压紧行距；极窄时侧栏折叠为图标轨道、只保留「链接 + 开始下载」，内容超高时卡片自动出现滚动条，任何尺寸都不会裁掉按钮
+- **拖动干净利落**：纯 Tk 非阻塞拖动，逐帧让系统重绘旧位置，不会出现多层窗口边框残影，也不会卡死/闪退
 - **窗口与内部布局自适应**：侧栏、卡片、输入框、任务行随窗口尺寸变化；窗口大小与位置自动记忆
 - **高 DPI 清晰渲染**：exe 内嵌 PerMonitor 清单，Tk 按真实 DPI 缩放字体，同时把几何尺寸等比放大、加深文字与边框对比度，高缩放屏（125% / 150%）不发虚
 
@@ -32,7 +34,7 @@ python run.py
 命令行：
 
 ```bash
-python -m fast_downloader.cli "https://example.com/file.zip" -o ./downloads -n file.zip -t 8
+python -m fast_downloader.cli "https://example.com/file.zip" -o ./downloads -n file.zip -t 16
 ```
 
 参数：
@@ -42,14 +44,14 @@ python -m fast_downloader.cli "https://example.com/file.zip" -o ./downloads -n f
 | `url` | 下载地址（必填） | — |
 | `-o/--output` | 保存目录 | 当前目录 |
 | `-n/--name` | 文件名（默认从 URL 推断） | 自动 |
-| `-t/--threads` | 线程数 | 8 |
+| `-t/--threads` | 线程数 | 16（最大） |
 
 ## 作为模块调用
 
 ```python
 from fast_downloader import Downloader
 
-dl = Downloader("https://example.com/file.zip", "./downloads", threads=8)
+dl = Downloader("https://example.com/file.zip", "./downloads", threads=16)
 dl.download(on_progress=lambda d, t, s: print(d, t, s))
 ```
 
@@ -66,9 +68,9 @@ dl.download(on_progress=lambda d, t, s: print(d, t, s))
 
 ```bash
 cd "项目目录"
-gh release create v1.4.0 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
-  --title "FastDownloader v1.4.0" \
-  --notes "高速多线程下载器 · 侧边导航多任务管理界面 · 蓝奏云等直链网盘自动解析 · 新扁平图标 · 单文件版 + 便携版（无 Temp 残留）"
+gh release create v1.4.1 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
+  --title "FastDownloader v1.4.1" \
+  --notes "高速多线程下载器 · 默认最大 16 线程 · 窗口可缩到身份证大小的三档响应式布局 · 拖动无残影不闪退 · 单文件版 + 便携版（无 Temp 残留）"
 ```
 
 ## 说明

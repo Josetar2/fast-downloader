@@ -15,11 +15,17 @@ from .core import Downloader, DownloadError
 
 IS_WIN = sys.platform == "win32"
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
+MAX_THREADS = 16
 
 # 几何按真实 DPI 等比放大：字体由 tk scaling 放大，固定像素若不跟着放大，
 # 高 DPI 屏上细线/小图标会显得发虚、拥挤。
 SCALE = 1.0
+# 由 _init_fonts() 按 DPI 计算；布局断点/边距都用「逻辑像素」思考，
+# 实际传给 Tk 的数值一律乘过 SCALE。
+PADX = 24
+PADY = 20
+CARD_PAD = 12
 
 
 def _s(v):
@@ -60,7 +66,8 @@ FONT_BTN = ("Segoe UI", 11, "bold")
 
 def _init_fonts(root):
     """挑一个最接近 SF Pro 的字体；中文由系统自动回退到雅黑。"""
-    global UI_FAM, FONT, FONT_T, FONT_S, FONT_SM, FONT_XS, FONT_TITLE, FONT_BTN, SCALE
+    global UI_FAM, FONT, FONT_T, FONT_S, FONT_SM, FONT_XS, FONT_TITLE, FONT_BTN
+    global SCALE, PADX, PADY, CARD_PAD
     try:
         import ctypes
         hdc = ctypes.windll.user32.GetDC(0)
@@ -69,6 +76,7 @@ def _init_fonts(root):
     except Exception:
         dpi = 96
     SCALE = max(1.0, min(2.5, (dpi or 96) / 96.0))
+    PADX, PADY, CARD_PAD = _s(24), _s(20), _s(12)
     try:
         import tkinter.font as tkfont
         fams = set(tkfont.families(root))
@@ -102,9 +110,34 @@ def _win_api():
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     u.IsZoomed.argtypes = [wintypes.HWND]
     u.IsZoomed.restype = wintypes.BOOL
-    # 不使用 SendMessageW/ReleaseCapture 触发 WM_NCLBUTTONDOWN：
-    # 那是同步模态循环，会重入 Tcl 解释器导致卡死/闪退。
+    # 拖动重绘用：RedrawWindow 让旧位置的桌面/其它窗口重画，清掉边框残影。
+    # 不再使用 SendMessageW(WM_NCLBUTTONDOWN) 的同步模态移动循环。
+    u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                               wintypes.WPARAM, wintypes.LPARAM]
+    u.PostMessageW.restype = wintypes.BOOL
+    u.ReleaseCapture.argtypes = []
+    u.ReleaseCapture.restype = wintypes.BOOL
+    u.RedrawWindow.argtypes = [wintypes.HWND, ctypes.c_void_p,
+                               ctypes.c_void_p, wintypes.UINT]
+    u.RedrawWindow.restype = wintypes.BOOL
     return u
+
+
+def _invalidate_desktop(x, y, w, h):
+    """重绘窗口旧位置所在的屏幕区域，清掉拖动可能留下的边框/残影。"""
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = _win_api()
+        u.GetDesktopWindow.restype = wintypes.HWND
+        r = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
+        # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN（异步，不阻塞拖动）
+        u.RedrawWindow(u.GetDesktopWindow(), ctypes.byref(r), None,
+                       0x0001 | 0x0004 | 0x0080)
+    except Exception:
+        pass
 
 
 def _rr(c, x1, y1, x2, y2, r, **kw):
@@ -182,6 +215,13 @@ class MacButton(tk.Canvas):
         self._draw()
         if self.command:
             self.command()
+
+    def resize(self, width):
+        """窄窗口下让主按钮跟着变宽，始终保持饱满的一行。"""
+        w = max(_s(48), int(width))
+        if abs(w - self.winfo_reqwidth()) > 1:
+            self.configure(width=w)
+            self._draw()
 
     def _draw(self):
         self.delete("all")
@@ -275,7 +315,8 @@ class Field(tk.Frame):
 
 
 class Card(tk.Frame):
-    """白色圆角卡片，两层极淡阴影（macOS 窗口卡片观感）。"""
+    """白色圆角卡片。fit 卡片填满可用高度，内容超高时自动出现纵向滚动条，
+    因此窗口无论缩到多小，底部按钮都不会被裁掉。"""
 
     PAD = 12
     R = 12
@@ -285,28 +326,52 @@ class Card(tk.Frame):
         super().__init__(parent, bg=BG_MAIN, **kw)
         self.PAD, self.R = _s(12), _s(12)
         self._fit = fit
-        self._cv = tk.Canvas(self, bg=BG_MAIN, highlightthickness=0, borderwidth=0)
-        self._cv.pack(fill="both", expand=True)
+        self._busy = False
+        self._sb_on = False
+        # fit 卡片不设固定高度，交给 pack(expand=True) 跟随窗口高度
+        self._cv = tk.Canvas(self, bg=BG_MAIN, highlightthickness=0,
+                             borderwidth=0, height=1 if fit else 265)
+        self._sb = ttk.Scrollbar(self, orient="vertical", command=self._cv.yview)
+        self._cv.configure(yscrollcommand=self._sb.set)
+        self._cv.pack(side="left", fill="both", expand=True)
         self._body = tk.Frame(self._cv, bg=CARD)
-        self._win = self._cv.create_window(self.PAD, self.PAD, window=self._body, anchor="nw")
+        self._win = self._cv.create_window(self.PAD, self.PAD,
+                                           window=self._body, anchor="nw")
         self.bind("<Configure>", self._redraw)
+        self._body.bind("<Configure>", self._redraw)
         Card._registry.append(self)
 
     def _redraw(self, e=None):
-        w, h = self.winfo_width(), self.winfo_height()
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            self._redraw_inner()
+        finally:
+            self._busy = False
+
+    def _redraw_inner(self):
+        w, h = self._cv.winfo_width(), self._cv.winfo_height()
         if w < 4 or h < 4:
             return
-        # fit 卡片：高度必须跟随内容自然高度重算。窗口缩放/DPI 变化后
-        # 若沿用启动时的高度，底部的按钮行会被内容窗口裁掉。
-        if self._fit:
-            self._body.update_idletasks()
-            need = self._body.winfo_reqheight() + 2 * self.PAD + _s(8)
-            if abs(h - need) > 2:
-                self._cv.configure(height=need)
+        self._body.update_idletasks()
+        p, r = self.PAD, self.R
+        content_h = self._body.winfo_reqheight() + 2 * p + _s(8)
+        content_w = self._body.winfo_reqwidth() + 2 * p
+        need_sb = bool(self._fit and content_h > h + 2)
+        if need_sb != self._sb_on:
+            self._sb_on = need_sb
+            if need_sb:
+                self._sb.pack(side="right", fill="y", padx=(0, _s(2)), pady=p)
+            else:
+                self._sb.pack_forget()
+        # 滚动条出现/消失会改变 canvas 宽度，重新取一次真实尺寸
+        w, h = self._cv.winfo_width(), self._cv.winfo_height()
+        if w < 4 or h < 4:
+            return
         # create_window 生成的内容窗口也是 canvas item，delete("all") 会连它一起删，
         # 导致卡片内表单消失；这里只删背景 tag。
         self._cv.delete("cardbg")
-        p, r = self.PAD, self.R
         _solid_rr(self._cv, p, p + _s(6), w - p, h - p + _s(6), r,
                   SHADOW2, tags="cardbg")
         _solid_rr(self._cv, p, p + _s(3), w - p, h - p + _s(3), r,
@@ -316,16 +381,33 @@ class Card(tk.Frame):
                   max(1, r - 1), CARD, tags="cardbg")
         self._cv.tag_lower("cardbg", self._win)
         self._cv.coords(self._win, p, p)
-        self._cv.itemconfig(self._win, width=w - 2 * p)
-        if not self._fit:
-            self._cv.itemconfig(self._win, height=h - 2 * p)
+        self._cv.itemconfig(self._win, width=max(_s(40), w - 2 * p))
+        self._cv.itemconfig(self._win, height=(
+            self._body.winfo_reqheight() if self._fit else max(_s(40), h - 2 * p)))
+        self._cv.configure(scrollregion=(0, 0, max(w, content_w),
+                                         max(h, content_h)))
+
+    def set_density(self, pad, body_pad):
+        """窗口变小时收紧卡片内外边距，让内容始终贴着可用空间排布。"""
+        pad, body_pad = int(pad), int(body_pad)
+        if pad == getattr(self, "_pad", None) and body_pad == getattr(self, "_body_pad", None):
+            return
+        self._pad, self._body_pad = pad, body_pad
+        self.PAD = pad
+        self.R = max(_s(5), int(pad * 0.9))
+        for ch in self._body.winfo_children():
+            try:
+                mgr = ch.winfo_manager()
+                if mgr == "pack":
+                    ch.pack_configure(padx=body_pad)
+                elif mgr == "grid":
+                    ch.grid_configure(padx=body_pad)
+            except Exception:
+                pass
+        self._redraw()
 
     def fit(self):
-        if not self._fit:
-            return
-        self._body.update_idletasks()
-        h = self._body.winfo_reqheight() + 2 * self.PAD + _s(8)
-        self._cv.configure(height=h)
+        self._redraw()
 
 
 class WinCtl(tk.Canvas):
@@ -374,9 +456,9 @@ class WinCtl(tk.Canvas):
 class TitleBar(tk.Frame):
     """自绘标题栏：左交通灯 + 居中标题 + 右侧窗口控制按钮。
 
-    拖动只走 Tk 的 Button-1 / B1-Motion，绝不调用
-    SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION)：那是同步的模态移动循环，
-    会在 Tcl 回调内嵌套 Win32 消息循环并重入解释器，导致卡死/闪退。
+    拖动走 Tk 的 Button-1 / B1-Motion，逐帧移动时主动让系统重绘旧位置，
+    避免残影；绝不在 Tcl 回调里调用 SendMessageW(WM_NCLBUTTONDOWN)：
+    那会同步嵌套 Win32 模态移动循环，导致卡死/闪退与边框轮廓残留。
     """
 
     H = 44
@@ -388,8 +470,9 @@ class TitleBar(tk.Frame):
         self.pack(side="top", fill="x")
         self.pack_propagate(False)
         self._page = page
-        self._drag = None      # 拖动中的 (dx, dy)；为 None 表示未拖动
+        self._drag = None      # 仅作为「无原生拖动」时的回退方案
         self._last = None
+        self._compact = False
 
         # ---- 左：macOS 交通灯，符号常显且真实可点 ----
         lamps = tk.Canvas(self, width=_s(88), height=self.H, bg=TITLE_BG,
@@ -446,8 +529,25 @@ class TitleBar(tk.Frame):
         self._page = name
         self.title.config(text=name)
 
+    def set_compact(self, flag):
+        """极窄窗口：隐藏右侧控制组，缩小交通灯，标题改小字。"""
+        if bool(flag) == self._compact:
+            return
+        self._compact = bool(flag)
+        if self._compact:
+            self._ctrl.pack_forget()
+            self.lamps.configure(width=_s(70))
+            self.title.configure(font=(UI_FAM, 11, "bold"))
+        else:
+            self._ctrl.pack(side="right", padx=(0, _s(8)))
+            self.lamps.configure(width=_s(88))
+            self.title.configure(font=FONT_TITLE)
+
     def _press(self, e):
-        # 非阻塞：只记录起点，绝不进入 Win32 模态循环
+        # 纯 Tk 非阻塞拖动：绝不在 Tcl 回调里调用
+        # SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION) —— 那是同步模态移动循环，
+        # 既会重入解释器导致卡死/闪退，又会在「拖动时不显示窗口内容」的
+        # 系统上画出一层层擦不掉的窗口边框轮廓。
         if IS_WIN and getattr(self.app, "_hwnd", None):
             try:
                 if _win_api().IsZoomed(self.app._hwnd):
@@ -458,6 +558,8 @@ class TitleBar(tk.Frame):
         self._drag = (e.x_root - self.app.winfo_rootx(),
                       e.y_root - self.app.winfo_rooty())
         self._last = None
+        self._old_rect = (self.app.winfo_rootx(), self.app.winfo_rooty(),
+                          self.app.winfo_width(), self.app.winfo_height())
         return "break"
 
     def _move(self, e):
@@ -468,12 +570,29 @@ class TitleBar(tk.Frame):
         if pos == self._last:
             return
         self._last = pos
+        # 先把旧位置交给系统重绘，再移动窗口，避免留下边框残影
+        old = getattr(self, "_old_rect", None)
+        if old:
+            _invalidate_desktop(*old)
         self.app.geometry(f"+{pos[0]}+{pos[1]}")
+        self._old_rect = (pos[0], pos[1],
+                          self.app.winfo_width(), self.app.winfo_height())
+        if IS_WIN and getattr(self.app, "_hwnd", None):
+            try:
+                # RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW
+                _win_api().RedrawWindow(self.app._hwnd, None, None,
+                                        0x0001 | 0x0004 | 0x0080 | 0x0100)
+            except Exception:
+                pass
         return "break"
 
     def _release(self, e):
+        old = getattr(self, "_old_rect", None)
+        if old:
+            _invalidate_desktop(*old)
         self._drag = None
         self._last = None
+        self._old_rect = None
 
 
 class NavItem(tk.Canvas):
@@ -488,6 +607,7 @@ class NavItem(tk.Canvas):
         self.app, self.name, self.glyph = app, name, glyph
         self._sel = False
         self._hover = False
+        self._compact = False
         self.bind("<Configure>", lambda e: self._draw())
         self.bind("<Enter>", lambda e: self._set(hover=True))
         self.bind("<Leave>", lambda e: self._set(hover=False))
@@ -501,6 +621,18 @@ class NavItem(tk.Canvas):
             self._hover = hover
         self._draw()
 
+    def set_compact(self, flag):
+        flag = bool(flag)
+        if flag != self._compact:
+            self._compact = flag
+            self.H = _s(30) if flag else _s(36)
+            self.configure(height=self.H)
+            try:
+                self.pack_configure(pady=1 if flag else 2)
+            except Exception:
+                pass
+            self._draw()
+
     def _draw(self):
         self.delete("all")
         w = self.winfo_width()
@@ -513,11 +645,14 @@ class NavItem(tk.Canvas):
         else:
             fill = SIDEBAR
         _solid_rr(self, 0, 0, w, self.H, _s(8), fill)
-        _glyph(self, self.glyph, _s(22), self.H / 2,
-               ACCENT_D if self._sel else "#5B5B63")
-        self.create_text(_s(42), self.H / 2 + 0.5, text=self.name, anchor="w",
-                         fill=ACCENT_D if self._sel else TEXT,
-                         font=(UI_FAM, 12, "bold" if self._sel else "normal"))
+        ink = ACCENT_D if self._sel else "#5B5B63"
+        if self._compact:
+            _glyph(self, self.glyph, w / 2, self.H / 2, ink)
+        else:
+            _glyph(self, self.glyph, _s(22), self.H / 2, ink)
+            self.create_text(_s(42), self.H / 2 + 0.5, text=self.name, anchor="w",
+                             fill=ACCENT_D if self._sel else TEXT,
+                             font=(UI_FAM, 12, "bold" if self._sel else "normal"))
 
 
 def _fmt(n: float) -> str:
@@ -664,6 +799,8 @@ class TaskRow(tk.Frame):
         self.task = task
         self.on_action = on_action
         self.columnconfigure(1, weight=1)
+        self._mode = None
+        self.bind("<Configure>", self._adapt)
 
         self.icon = tk.Canvas(self, width=30, height=32, bg=CARD, highlightthickness=0)
         self.icon.grid(row=0, column=0, padx=(4, 12), pady=8)
@@ -691,6 +828,26 @@ class TaskRow(tk.Frame):
 
         sep = tk.Frame(self, bg=ROW_LINE, height=1)
         sep.grid(row=1, column=0, columnspan=7, sticky="ew", padx=4)
+
+    def _adapt(self, e=None):
+        """窗口变窄时按可用宽度收起次要信息列，主文件名永远占满剩余空间。"""
+        w = self.winfo_width()
+        if w < 20:
+            return
+        mode = 2 if w < _s(420) else (1 if w < _s(700) else 0)
+        if mode == self._mode:
+            return
+        self._mode = mode
+        for widget, visible in ((self.meta, mode == 0),
+                                (self.pbar, mode == 0),
+                                (self.pct, mode == 0),
+                                (self.stat, True)):
+            if visible:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        reserve = _s(380) if mode == 0 else (_s(230) if mode == 1 else _s(150))
+        self.name.configure(wraplength=max(_s(70), w - reserve))
 
     def update(self, t: Task, first=False):
         self.task = t
@@ -738,13 +895,15 @@ class App(tk.Tk):
         try:
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
-            w = max(_s(940), min(_s(1220), int(sw * 0.7)))
-            h = max(_s(640), min(_s(820), int(sh * 0.82)))
+            w = max(_s(560), min(_s(1000), int(sw * 0.62)))
+            h = max(_s(420), min(_s(680), int(sh * 0.68)))
             self.geometry(f"{w}x{h}")
         except Exception:
-            self.geometry(f"{_s(1040)}x{_s(700)}")
+            self.geometry(f"{_s(960)}x{_s(650)}")
         self.resizable(True, True)
-        self.minsize(_s(900), _s(680))
+        # 最小约一张身份证（85.6×54mm ≈ 320×210 逻辑像素），主打简约。
+        # 不再把 minsize 定到 900×680，窗口可真正自由地缩到很小。
+        self.minsize(_s(320), _s(210))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # DPI 缩放：让 Tk 按真实 DPI 设置字体尺寸，避免模糊/过小
         try:
@@ -763,6 +922,15 @@ class App(tk.Tk):
         self._nav = {}
         self._hwnd = None
         self._zoomed = False
+        # 响应式布局状态
+        self._mode = None          # 0 完整 / 1 紧凑 / 2 极简（身份证大小）
+        self._compact = None
+        self._last_size = None
+        self._cur_pad = None
+        self._cur_pady = None
+        self._pack_opts = {}
+        self._pack_before = {}
+        self._ready = False
 
         ico = self._app_path("app.ico")
         if os.path.exists(ico):
@@ -774,6 +942,10 @@ class App(tk.Tk):
         self._build_style()
         self.bind("<Configure>", self._on_resize)
         self.configure(bg=SEPARATOR)
+        # 关键：不要让子控件的「自然请求尺寸」反过来把顶层窗口撑回去。
+        # 否则从外部把窗口缩小后，Tk 会在下一次几何计算时又放大到内容宽度，
+        # 表现为「窗口拖不小 / UI 不跟着缩」。
+        self.pack_propagate(False)
         self._titlebar = TitleBar(self, self.current)
         self._body = tk.Frame(self, bg=BG_MAIN)
         self._body.pack(side="top", fill="both", expand=True, padx=1, pady=(0, 1))
@@ -786,6 +958,9 @@ class App(tk.Tk):
         self._show(self.current)
         for c in Card._registry:
             c.fit()
+        self._ready = True
+        self.update_idletasks()
+        self._relayout(self.winfo_width(), self.winfo_height())
         self._center_on_screen()
         # 隐藏 Windows 系统标题栏，保留系统边框/阴影/任务栏/最小化/缩放
         self.update_idletasks()
@@ -794,16 +969,148 @@ class App(tk.Tk):
         self.after(180, lambda: self._hwnd is None and self._mac_frame())
         self._tick()
 
+    # ---------- 响应式布局：完整 / 紧凑 / 极简（身份证大小）----------
     def _on_resize(self, e):
-        """窗口缩放时侧栏与内容区一起跟随，避免固定宽度显得脱节。"""
-        if e.widget is not self or not hasattr(self, "side"):
+        """只有尺寸变化才重排；纯位置移动（拖动）不触发，避免逐帧重绘。"""
+        if e.widget is not self or not getattr(self, "_ready", False):
             return
-        tb = getattr(self, "_titlebar", None)
-        if tb is not None and getattr(tb, "_drag", None):
-            return  # 拖动中尺寸未变，跳过重排，避免 Configure 反复触发
-        target = max(self._side_min, min(_s(280), int(e.width * 0.18)))
+        if e.width < 2 or e.height < 2:
+            return
+        size = (e.width, e.height)
+        if size == self._last_size:
+            return
+        self._last_size = size
+        self._relayout(e.width, e.height)
+
+    def _pack_state(self, w, visible):
+        """记住控件最初的 pack 参数，折叠/展开时原样还原。"""
+        if w is None:
+            return
+        key = id(w)
+        if key not in self._pack_opts:
+            info = w.pack_info() if w.winfo_manager() == "pack" else {}
+            self._pack_opts[key] = {
+                k: info[k] for k in ("side", "anchor", "fill", "expand",
+                                     "padx", "pady", "ipadx", "ipady") if k in info
+            } or {"side": "top"}
+            # 记住原来的 pack 顺序，折叠后还原时不能跑到容器末尾
+            try:
+                slaves = list(w.master.pack_slaves())
+                i = slaves.index(w)
+                self._pack_before[key] = slaves[i + 1] if i + 1 < len(slaves) else None
+            except Exception:
+                self._pack_before[key] = None
+        if visible:
+            if w.winfo_manager() != "pack":
+                try:
+                    before = self._pack_before.get(key)
+                    if before is not None and before.winfo_manager() == "pack":
+                        w.pack(before=before, **self._pack_opts[key])
+                    else:
+                        w.pack(**self._pack_opts[key])
+                except Exception:
+                    pass
+        elif w.winfo_manager():
+            try:
+                w.pack_forget()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _grid_state(w, visible):
+        if w is None:
+            return
+        try:
+            if visible:
+                if w.winfo_manager() != "grid":
+                    w.grid()        # grid_remove 之后会恢复原先的行列参数
+            elif w.winfo_manager() == "grid":
+                w.grid_remove()
+        except Exception:
+            pass
+
+    def _relayout(self, w, h):
+        logical = w / max(SCALE, 1.0)
+        mode = 0 if logical >= 860 else (1 if logical >= 560 else 2)
+        # 侧栏宽度连续跟随窗口；窄屏折叠成图标轨道
+        if mode == 0:
+            target = max(_s(180), min(_s(280), int(w * 0.18), int(w * 0.32)))
+        else:
+            target = max(_s(44), min(_s(70), int(w * 0.15)))
         if abs(target - self.side.winfo_width()) > 1:
             self.side.configure(width=target)
+        if self._mode != mode:
+            self._mode = mode
+            self._apply_mode(mode)
+        px, py = ((PADX, PADY) if mode == 0 else
+                  (_s(14), _s(12)) if mode == 1 else (_s(8), _s(8)))
+        if (px, py) != (self._cur_pad, self._cur_pady):
+            self._cur_pad, self._cur_pady = px, py
+            for panel in self._panels.values():
+                if panel.winfo_manager():
+                    panel.pack_configure(padx=px, pady=py)
+
+    def _set_sidebar_compact(self, compact):
+        self._pack_state(self._side_txt, not compact)
+        self._pack_state(self._side_ver, not compact)
+        self._pack_state(self._side_sep, not compact)
+        try:
+            self._side_head.pack_configure(
+                padx=0 if compact else _s(16),
+                pady=(_s(6), _s(6)) if compact else (_s(20), _s(16)))
+            self._side_ic.pack_configure(anchor="center" if compact else "n",
+                                         padx=0 if compact else (0, _s(10)))
+            self._nav_wrap.pack_configure(padx=_s(6) if compact else _s(10))
+        except Exception:
+            pass
+
+    def _apply_mode(self, mode):
+        compact, mini = mode > 0, mode == 2
+        pad = CARD_PAD if mode == 0 else (_s(9) if mode == 1 else _s(6))
+        body_pad = PADX if mode == 0 else (_s(14) if mode == 1 else _s(8))
+        py = PADY if mode == 0 else (_s(10) if mode == 1 else _s(4))
+        if compact != self._compact:
+            self._compact = compact
+            self._set_sidebar_compact(compact)
+            for item in self._nav.values():
+                item.set_compact(compact)
+        self._titlebar.set_compact(mini)
+        # 副标题在窄窗口真正收起（不是留空行），页面标题改小字
+        for sub, text in ((self._new_sub, "粘贴直链或网盘分享链接，支持分块并发与断点续传"),
+                          (self._tasks_sub, "正在下载与排队中的任务"),
+                          (self._done_sub, "已结束的全部任务"),
+                          (self._set_sub, "调整并发与默认下载参数")):
+            sub.configure(text=text)
+            self._pack_state(sub, not compact)
+            if not compact:
+                sub.pack_configure(padx=body_pad, pady=(0, py))
+        for title in (self._new_title, self._tasks_title, self._done_title, self._set_title):
+            title.configure(font=FONT_S if compact else FONT_T)
+            title.pack_configure(padx=body_pad, pady=(py, 4 if not compact else 2))
+        for frm in (self._new_form, self._set_form):
+            frm.pack_configure(padx=body_pad, pady=(0, py))
+        for lst in (self.tasks_list, self.done_list):
+            lst.pack_configure(padx=body_pad, pady=(0, py))
+        # 紧凑/极简：把表单行间距压紧，避免中等窗口还要滚动才能看到按钮
+        for opts in (self._new_pady, self._set_pady):
+            for w, orig in opts.items():
+                try:
+                    w.grid_configure(pady=(_s(2) if compact else orig))
+                except Exception:
+                    pass
+        # 极简模式：只保留「链接 + 开始下载」，其余字段与次要按钮收起
+        for w in self._new_optional:
+            self._grid_state(w, not mini)
+        self._grid_state(self._parse_btn, not mini)
+        self._grid_state(self._threads_note, not mini)
+        self._grid_state(self._new_info, not mini)
+        self._pack_state(self._open_btn, not mini)
+        for w in self._set_optional:
+            self._grid_state(w, not mini)
+        self._new_info.configure(wraplength=_s(230) if mini else 0)
+        self._start_btn.resize(_s(160) if mini else _s(120))
+        for c in Card._registry:
+            c.set_density(pad, body_pad)
 
     # ---------- 无边框 macOS 窗口（仅 Windows 生效）----------
     def _mac_frame(self):
@@ -1008,9 +1315,10 @@ class App(tk.Tk):
             relx=1.0, y=0, relheight=1, anchor="ne")
 
         head = tk.Frame(side, bg=SIDEBAR)
-        head.pack(fill="x", padx=16, pady=(20, 16))
+        head.pack(fill="x", padx=_s(16), pady=(_s(20), _s(16)))
         ic = tk.Canvas(head, width=_s(38), height=_s(38), bg=SIDEBAR, highlightthickness=0)
-        ic.pack(side="left", anchor="n", padx=(0, 10))
+        ic.pack(side="left", anchor="n", padx=(0, _s(10)))
+        self._side_head, self._side_ic = head, ic
         _solid_rr(ic, 1, 1, _s(37), _s(37), _s(9), FILE_TINT)
         _solid_rr(ic, 1, 1, _s(37), _s(19), _s(9), "#3D9BFF")
         ic.create_rectangle(1, _s(16), _s(37), _s(28), fill=FILE_TINT, outline="")
@@ -1025,22 +1333,28 @@ class App(tk.Tk):
 
         txt = tk.Frame(head, bg=SIDEBAR)
         txt.pack(side="left", fill="x")
+        self._side_txt = txt
         tk.Label(txt, text="高速下载器", bg=SIDEBAR, fg=TEXT,
                  font=(UI_FAM, 14, "bold"), anchor="w").pack(anchor="w", pady=(1, 0))
         tk.Label(txt, text="Fast Downloader", bg=SIDEBAR, fg=SUB,
                  font=FONT_XS, anchor="w").pack(anchor="w", pady=(2, 0))
 
-        tk.Frame(side, bg="#D9D9E0", height=1).pack(fill="x", padx=16, pady=(0, 12))
+        sep = tk.Frame(side, bg="#D9D9E0", height=1)
+        sep.pack(fill="x", padx=_s(16), pady=(0, _s(12)))
+        self._side_sep = sep
 
         nav_wrap = tk.Frame(side, bg=SIDEBAR)
-        nav_wrap.pack(fill="x", padx=10)
+        nav_wrap.pack(fill="x", padx=_s(10))
+        self._nav_wrap = nav_wrap
         for name, glyph in items:
             item = NavItem(nav_wrap, self, name, glyph, width - 20)
             item.pack(fill="x", pady=2)
             self._nav[name] = item
 
-        tk.Label(side, text=f"v{APP_VERSION}", bg=SIDEBAR, fg="#A5A5AC",
-                 font=FONT_XS).pack(side="bottom", anchor="w", padx=18, pady=(0, 16))
+        ver = tk.Label(side, text=f"v{APP_VERSION}", bg=SIDEBAR, fg="#A5A5AC",
+                       font=FONT_XS)
+        ver.pack(side="bottom", anchor="w", padx=_s(18), pady=(0, _s(16)))
+        self._side_ver = ver
 
     # ---------- 内容区 ----------
     def _build_content(self):
@@ -1054,47 +1368,60 @@ class App(tk.Tk):
             item._set(selected=(n == name))
         for f in self._panels.values():
             f.pack_forget()
-        self._panels[name].pack(fill="both", expand=True, padx=26, pady=22)
+        self._panels[name].pack(
+            fill="both", expand=True,
+            padx=PADX if self._cur_pad is None else self._cur_pad,
+            pady=PADY if self._cur_pady is None else self._cur_pady)
 
     # ---------- 新建下载 ----------
     def _build_new(self):
         wrap = tk.Frame(self.content, bg=BG_MAIN)
         self._panels["新建下载"] = wrap
         card = Card(wrap, fit=True)
-        card.pack(fill="x")
+        card.pack(fill="both", expand=True)
         body = card._body
-        tk.Label(body, text="新建下载任务", bg=CARD, fg=TEXT,
-                 font=FONT_T).pack(anchor="w", padx=24, pady=(20, 4))
-        tk.Label(body, text="粘贴直链或网盘分享链接，支持分块并发与断点续传",
-                 bg=CARD, fg=SUB, font=FONT_SM).pack(anchor="w", padx=24, pady=(0, 14))
+        self._new_title = tk.Label(body, text="新建下载任务", bg=CARD, fg=TEXT,
+                                   font=FONT_T)
+        self._new_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._new_sub = tk.Label(
+            body, text="粘贴直链或网盘分享链接，支持分块并发与断点续传",
+            bg=CARD, fg=SUB, font=FONT_SM)
+        self._new_sub.pack(anchor="w", padx=PADX, pady=(0, _s(14)))
+        self._new_body = body
 
         f = tk.Frame(body, bg=CARD)
-        f.pack(fill="x", padx=24, pady=(0, 20))
+        f.pack(fill="x", padx=PADX, pady=(0, PADY))
         f.columnconfigure(0, weight=1)
+        self._new_form = f
 
-        tk.Label(f, text="下载链接", bg=CARD, fg=TEXT, font=FONT,
-                 anchor="w").grid(row=0, column=0, sticky="w", pady=(4, 4))
+        url_label = tk.Label(f, text="下载链接", bg=CARD, fg=TEXT, font=FONT,
+                             anchor="w")
+        url_label.grid(row=0, column=0, sticky="w", pady=(4, 4))
         row0 = tk.Frame(f, bg=CARD)
         row0.grid(row=1, column=0, columnspan=3, sticky="ew", pady=2)
         row0.columnconfigure(0, weight=1)
         self.url_e = Field(row0, _make_entry)
         self.url_e.grid(row=0, column=0, sticky="ew")
-        MacButton(row0, "解析", self._resolve, kind="link", width=88,
-                  bg=CARD).grid(row=0, column=1, padx=(8, 0))
+        self._parse_btn = MacButton(row0, "解析", self._resolve, kind="link",
+                                    width=88, bg=CARD)
+        self._parse_btn.grid(row=0, column=1, padx=(_s(8), 0))
 
-        tk.Label(f, text="保存位置", bg=CARD, fg=TEXT, font=FONT,
-                 anchor="w").grid(row=2, column=0, sticky="w", pady=(14, 4))
+        save_label = tk.Label(f, text="保存位置", bg=CARD, fg=TEXT, font=FONT,
+                              anchor="w")
+        save_label.grid(row=2, column=0, sticky="w", pady=(_s(14), 4))
         row1 = tk.Frame(f, bg=CARD)
         row1.grid(row=3, column=0, columnspan=3, sticky="ew", pady=2)
         row1.columnconfigure(0, weight=1)
         self.save_e = Field(row1, _make_entry)
         self.save_e.insert(0, os.path.join(os.path.expanduser("~"), "Desktop"))
         self.save_e.grid(row=0, column=0, sticky="ew")
-        MacButton(row1, "浏览…", self._choose_dir, width=88,
-                  bg=CARD).grid(row=0, column=1, padx=(8, 0))
+        self._browse_btn = MacButton(row1, "浏览…", self._choose_dir,
+                                     width=88, bg=CARD)
+        self._browse_btn.grid(row=0, column=1, padx=(_s(8), 0))
 
-        tk.Label(f, text="文件名（留空自动）", bg=CARD, fg=TEXT, font=FONT,
-                 anchor="w").grid(row=4, column=0, sticky="w", pady=(14, 4))
+        name_label = tk.Label(f, text="文件名（留空自动）", bg=CARD, fg=TEXT,
+                              font=FONT, anchor="w")
+        name_label.grid(row=4, column=0, sticky="w", pady=(_s(14), 4))
         rown = tk.Frame(f, bg=CARD)
         rown.grid(row=5, column=0, columnspan=3, sticky="ew", pady=2)
         rown.columnconfigure(0, weight=1)
@@ -1102,21 +1429,35 @@ class App(tk.Tk):
         self.name_e = Field(rown, _make_entry)
         self.name_e.grid(row=0, column=0, sticky="ew")
 
-        tk.Label(f, text="线程数", bg=CARD, fg=TEXT, font=FONT,
-                 anchor="w").grid(row=6, column=0, sticky="w", pady=(14, 4))
+        threads_label = tk.Label(f, text="线程数", bg=CARD, fg=TEXT, font=FONT,
+                                 anchor="w")
+        threads_label.grid(row=6, column=0, sticky="w", pady=(_s(14), 4))
         self.threads_e = Field(f, lambda c: _make_combo(
-            c, [str(i) for i in range(1, 17)], "8"), width=116)
+            c, [str(i) for i in range(1, MAX_THREADS + 1)], str(MAX_THREADS)),
+            width=116)
         self.threads_e.grid(row=7, column=0, sticky="w", pady=2)
+        self._threads_note = tk.Label(f, text=f"默认最大 {MAX_THREADS} 线程",
+                                      bg=CARD, fg=SUB, font=FONT_SM, anchor="w")
+        self._threads_note.grid(row=7, column=1, sticky="w", padx=(_s(12), 0))
 
-        self.new_info = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SM, anchor="w")
-        self.new_info.grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 4))
+        self.new_info = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SM,
+                                 anchor="w")
+        self.new_info.grid(row=8, column=0, columnspan=3, sticky="w",
+                           pady=(_s(12), 4))
+        self._new_info = self.new_info
 
         btns = tk.Frame(f, bg=CARD)
-        btns.grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        MacButton(btns, "开始下载", self._add_task, kind="primary",
-                  width=120, bg=CARD).pack(side="left", padx=(0, 10))
-        MacButton(btns, "打开文件夹", self._open_folder, width=112,
-                  bg=CARD).pack(side="left")
+        btns.grid(row=9, column=0, columnspan=3, sticky="w", pady=(_s(8), 0))
+        self._start_btn = MacButton(btns, "开始下载", self._add_task,
+                                    kind="primary", width=120, bg=CARD)
+        self._start_btn.pack(side="left", padx=(0, _s(10)))
+        self._open_btn = MacButton(btns, "打开文件夹", self._open_folder,
+                                   width=112, bg=CARD)
+        self._open_btn.pack(side="left")
+        # 极简模式下收起的控件
+        self._new_optional = [save_label, row1, name_label, rown,
+                              threads_label, self.threads_e]
+        self._new_pady = {w: w.grid_info().get("pady", "0") for w in f.grid_slaves()}
 
     def _choose_dir(self):
         d = filedialog.askdirectory()
@@ -1145,7 +1486,8 @@ class App(tk.Tk):
                 eff = r["url"]
                 headers = r.get("headers", {})
                 name = Downloader._guess_filename(eff)
-            dl = Downloader(eff, self.save_e.get() or ".", filename=name, threads=8)
+            dl = Downloader(eff, self.save_e.get() or ".", filename=name,
+                            threads=MAX_THREADS)
             dl.extra_headers = headers
             total, ranged = dl.probe()
             self.new_info.config(
@@ -1163,9 +1505,9 @@ class App(tk.Tk):
             messagebox.showwarning("提示", "请先填写下载链接")
             return
         try:
-            threads = int(self.threads_e.get() or 8)
+            threads = int(self.threads_e.get() or MAX_THREADS)
         except Exception:
-            threads = 8
+            threads = MAX_THREADS
         t = Task(url, self.save_e.get() or ".", self.name_e.get().strip() or None, threads)
         self.mgr.add(t)
         self._show("任务列表")
@@ -1177,12 +1519,14 @@ class App(tk.Tk):
         card = Card(wrap)
         card.pack(fill="both", expand=True)
         body = card._body
-        tk.Label(body, text="任务列表", bg=CARD, fg=TEXT,
-                 font=FONT_T).pack(anchor="w", padx=24, pady=(20, 4))
-        tk.Label(body, text="正在下载与排队中的任务", bg=CARD, fg=SUB,
-                 font=FONT_SM).pack(anchor="w", padx=24, pady=(0, 10))
+        self._tasks_title = tk.Label(body, text="任务列表", bg=CARD, fg=TEXT,
+                                     font=FONT_T)
+        self._tasks_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._tasks_sub = tk.Label(body, text="正在下载与排队中的任务", bg=CARD,
+                                   fg=SUB, font=FONT_SM)
+        self._tasks_sub.pack(anchor="w", padx=PADX, pady=(0, _s(10)))
         self.tasks_list = TaskList(body, self.mgr, self._on_task_action)
-        self.tasks_list.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.tasks_list.pack(fill="both", expand=True, padx=_s(14), pady=(0, _s(14)))
 
     def _on_task_action(self, action, task):
         if action == "cancel":
@@ -1198,54 +1542,67 @@ class App(tk.Tk):
         card = Card(wrap)
         card.pack(fill="both", expand=True)
         body = card._body
-        tk.Label(body, text="完成记录", bg=CARD, fg=TEXT,
-                 font=FONT_T).pack(anchor="w", padx=24, pady=(20, 4))
-        tk.Label(body, text="已结束的全部任务", bg=CARD, fg=SUB,
-                 font=FONT_SM).pack(anchor="w", padx=24, pady=(0, 10))
+        self._done_title = tk.Label(body, text="完成记录", bg=CARD, fg=TEXT,
+                                    font=FONT_T)
+        self._done_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._done_sub = tk.Label(body, text="已结束的全部任务", bg=CARD, fg=SUB,
+                                  font=FONT_SM)
+        self._done_sub.pack(anchor="w", padx=PADX, pady=(0, _s(10)))
         self.done_list = TaskList(body, self.mgr, lambda a, t: None)
-        self.done_list.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.done_list.pack(fill="both", expand=True, padx=_s(14), pady=(0, _s(14)))
 
     # ---------- 设置 ----------
     def _build_settings(self):
         wrap = tk.Frame(self.content, bg=BG_MAIN)
         self._panels["设置"] = wrap
         card = Card(wrap, fit=True)
-        card.pack(fill="x")
+        card.pack(fill="both", expand=True)
         body = card._body
-        tk.Label(body, text="设置", bg=CARD, fg=TEXT,
-                 font=FONT_T).pack(anchor="w", padx=24, pady=(20, 4))
-        tk.Label(body, text="调整并发与默认下载参数", bg=CARD, fg=SUB,
-                 font=FONT_SM).pack(anchor="w", padx=24, pady=(0, 14))
+        self._set_title = tk.Label(body, text="设置", bg=CARD, fg=TEXT,
+                                   font=FONT_T)
+        self._set_title.pack(anchor="w", padx=PADX, pady=(PADY, 4))
+        self._set_sub = tk.Label(body, text="调整并发与默认下载参数", bg=CARD,
+                                 fg=SUB, font=FONT_SM)
+        self._set_sub.pack(anchor="w", padx=PADX, pady=(0, _s(14)))
         f = tk.Frame(body, bg=CARD)
-        f.pack(fill="x", padx=24, pady=(0, 22))
-        f.columnconfigure(0, minsize=150)
+        f.pack(fill="x", padx=PADX, pady=(0, PADY))
+        f.columnconfigure(0, minsize=_s(150))
         f.columnconfigure(1, weight=1)
+        self._set_form = f
 
         tk.Label(f, text="最大同时下载数", bg=CARD, fg=TEXT,
-                 font=FONT).grid(row=0, column=0, sticky="w", pady=9)
+                 font=FONT).grid(row=0, column=0, sticky="w", pady=_s(9))
         self.max_e = Field(f, lambda c: _make_combo(
-            c, [str(i) for i in range(1, 11)], str(self.mgr.max_concurrent)), width=116)
-        self.max_e.grid(row=0, column=1, sticky="w", pady=9)
+            c, [str(i) for i in range(1, 11)], str(self.mgr.max_concurrent)),
+            width=116)
+        self.max_e.grid(row=0, column=1, sticky="w", pady=_s(9))
 
-        tk.Label(f, text="默认保存位置", bg=CARD, fg=TEXT,
-                 font=FONT).grid(row=1, column=0, sticky="w", pady=(14, 5))
+        save_label = tk.Label(f, text="默认保存位置", bg=CARD, fg=TEXT,
+                              font=FONT)
+        save_label.grid(row=1, column=0, sticky="w", pady=(_s(14), 5))
         row = tk.Frame(f, bg=CARD)
         row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=2)
         row.columnconfigure(0, weight=1)
         self.def_save_e = Field(row, _make_entry)
         self.def_save_e.insert(0, os.path.join(os.path.expanduser("~"), "Desktop"))
         self.def_save_e.grid(row=0, column=0, sticky="ew")
-        MacButton(row, "浏览…", self._choose_def, width=88,
-                  bg=CARD).grid(row=0, column=1, padx=(8, 0))
+        self._choose_def_btn = MacButton(row, "浏览…", self._choose_def,
+                                         width=88, bg=CARD)
+        self._choose_def_btn.grid(row=0, column=1, padx=(_s(8), 0))
 
-        tk.Label(f, text="默认线程数", bg=CARD, fg=TEXT,
-                 font=FONT).grid(row=3, column=0, sticky="w", pady=(14, 5))
+        threads_label = tk.Label(f, text="默认线程数", bg=CARD, fg=TEXT,
+                                 font=FONT)
+        threads_label.grid(row=3, column=0, sticky="w", pady=(_s(14), 5))
         self.def_threads_e = Field(f, lambda c: _make_combo(
-            c, [str(i) for i in range(1, 17)], "8"), width=116)
+            c, [str(i) for i in range(1, MAX_THREADS + 1)], str(MAX_THREADS)),
+            width=116)
         self.def_threads_e.grid(row=3, column=1, sticky="w", pady=5)
 
         MacButton(f, "保存设置", self._save_settings, kind="primary",
-                  width=112, bg=CARD).grid(row=4, column=0, sticky="w", pady=(20, 0))
+                  width=112, bg=CARD).grid(row=4, column=0, sticky="w",
+                                           pady=(_s(20), 0))
+        self._set_optional = [save_label, row, threads_label, self.def_threads_e]
+        self._set_pady = {w: w.grid_info().get("pady", "0") for w in f.grid_slaves()}
 
     def _choose_def(self):
         d = filedialog.askdirectory()

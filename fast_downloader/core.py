@@ -43,7 +43,7 @@ class Downloader:
         url: str,
         save_dir: str,
         filename: str | None = None,
-        threads: int = 8,
+        threads: int = 16,
         timeout: int = 30,
         retries: int = 5,
         user_agent: str = DEFAULT_UA,
