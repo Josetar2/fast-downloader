@@ -4,7 +4,8 @@
 
 ## 特性
 
-- 多线程分块下载（基于 HTTP `Range`），**默认使用最大 16 线程**，可在界面 / 命令行调整
+- 多线程分块下载（基于 HTTP `Range`），**默认 16 线程、最高 128**，可在界面 / 命令行调整
+- **自适应分块**：每块不小于 2 MB，线程数按文件大小自动收敛 —— 20 MB 文件选 128 线程实际只切 10 块，避免块太碎导致建连开销超过传输本身
 - 服务器不支持分块时自动降级为单线程流式下载
 - 断点续传：中断后重跑会复用已下载的分块
 - 实时进度 / 速度显示
@@ -44,14 +45,14 @@ python -m fast_downloader.cli "https://example.com/file.zip" -o ./downloads -n f
 | `url` | 下载地址（必填） | — |
 | `-o/--output` | 保存目录 | 当前目录 |
 | `-n/--name` | 文件名（默认从 URL 推断） | 自动 |
-| `-t/--threads` | 线程数 | 16（最大） |
+| `-t/--threads` | 线程数 | 16（上限 128，实际分块数按文件大小自动收敛） |
 
 ## 作为模块调用
 
 ```python
 from fast_downloader import Downloader
 
-dl = Downloader("https://example.com/file.zip", "./downloads", threads=16)
+dl = Downloader("https://example.com/file.zip", "./downloads", threads=16)  # 上限 128
 dl.download(on_progress=lambda d, t, s: print(d, t, s))
 ```
 
@@ -68,9 +69,9 @@ dl.download(on_progress=lambda d, t, s: print(d, t, s))
 
 ```bash
 cd "项目目录"
-gh release create v1.4.2 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
-  --title "FastDownloader v1.4.2" \
-  --notes "高速多线程下载器 · 默认最大 16 线程 · Windows 原生窗口拖动零残影 · 简约矢量界面 · 可缩到身份证大小的三档响应式布局 · 单文件版 + 便携版（无 Temp 残留）"
+gh release create v1.5.0 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
+  --title "FastDownloader v1.5.0" \
+  --notes "高速多线程下载器 · 线程数上限提升到 128 并自适应分块 · Windows 原生窗口拖动零残影 · 简约矢量界面 · 可缩到身份证大小的三档响应式布局 · 单文件版 + 便携版（无 Temp 残留）"
 ```
 
 ## 说明

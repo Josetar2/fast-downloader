@@ -6,7 +6,7 @@ import argparse
 import sys
 import time
 
-from .core import Downloader, DownloadError
+from .core import DEFAULT_THREADS, MAX_THREADS, Downloader, DownloadError
 
 
 def _fmt_size(n: float) -> str:
@@ -27,7 +27,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("url", help="下载地址")
     p.add_argument("-o", "--output", default=".", help="保存目录（默认当前目录）")
     p.add_argument("-n", "--name", default=None, help="文件名（默认从 URL 推断）")
-    p.add_argument("-t", "--threads", type=int, default=16, help="线程数（默认 16，最大）")
+    p.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS,
+                   help=f"线程数（默认 {DEFAULT_THREADS}，上限 {MAX_THREADS}；"
+                        f"实际分块数会按文件大小自动收敛）")
     args = p.parse_args(argv)
 
     dl = Downloader(args.url, args.output, filename=args.name, threads=args.threads)

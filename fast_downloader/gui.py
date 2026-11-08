@@ -11,10 +11,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import netdisk
-from .core import Downloader, DownloadError
+from .core import DEFAULT_THREADS, MAX_THREADS, Downloader, DownloadError
 
-APP_VERSION = "1.4.2"
-MAX_THREADS = 16
+APP_VERSION = "1.5.0"
+
+# 线程数下拉档位：不给 1~128 全列（太长、还会诱导选无意义的碎块），
+# 只给工程上真正有区别的几档，选满 128 时也会按文件大小自动收敛分块数。
+THREAD_CHOICES = ["8", "16", "24", "32", "48", "64", "96", "128"]
 
 # 几何按真实 DPI 等比放大：字体由 tk scaling 放大，固定像素若不跟着放大，
 # 高 DPI 屏上细线/小图标会显得发虚、拥挤。
@@ -187,6 +190,15 @@ def _make_combo(parent, values, default):
                      style="Plain.TCombobox")
     c.set(default)
     return c
+
+
+def _ui_threads(value=None) -> int:
+    """把下拉字符串收敛成合法线程数：空值走默认，越界夹到 [1, MAX_THREADS]。"""
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_THREADS
+    return max(1, min(n, MAX_THREADS))
 
 
 class Field(tk.Frame):
@@ -1195,11 +1207,12 @@ class App(tk.Tk):
                                  anchor="w")
         threads_label.grid(row=6, column=0, sticky="w", pady=(_s(14), 4))
         self.threads_e = Field(f, lambda c: _make_combo(
-            c, [str(i) for i in range(1, MAX_THREADS + 1)], str(MAX_THREADS)),
+            c, THREAD_CHOICES, str(DEFAULT_THREADS)),
             width=116)
         self.threads_e.grid(row=7, column=0, sticky="w", pady=2)
-        self._threads_note = tk.Label(f, text=f"默认最大 {MAX_THREADS} 线程",
-                                      bg=CARD, fg=SUB, font=FONT_SM, anchor="w")
+        self._threads_note = tk.Label(
+            f, text=f"默认 {DEFAULT_THREADS}，最高 {MAX_THREADS}（按文件大小自动分块）",
+            bg=CARD, fg=SUB, font=FONT_SM, anchor="w")
         self._threads_note.grid(row=7, column=1, sticky="w", padx=(_s(12), 0))
 
         self.new_info = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SM,
@@ -1249,7 +1262,7 @@ class App(tk.Tk):
                 headers = r.get("headers", {})
                 name = Downloader._guess_filename(eff)
             dl = Downloader(eff, self.save_e.get() or ".", filename=name,
-                            threads=MAX_THREADS)
+                            threads=_ui_threads())
             dl.extra_headers = headers
             total, ranged = dl.probe()
             self.new_info.config(
@@ -1266,10 +1279,7 @@ class App(tk.Tk):
         if not url:
             messagebox.showwarning("提示", "请先填写下载链接")
             return
-        try:
-            threads = int(self.threads_e.get() or MAX_THREADS)
-        except Exception:
-            threads = MAX_THREADS
+        threads = _ui_threads(self.threads_e.get())
         t = Task(url, self.save_e.get() or ".", self.name_e.get().strip() or None, threads)
         self.mgr.add(t)
         self._show("任务列表")
@@ -1356,7 +1366,7 @@ class App(tk.Tk):
                                  font=FONT)
         threads_label.grid(row=3, column=0, sticky="w", pady=(_s(14), 5))
         self.def_threads_e = Field(f, lambda c: _make_combo(
-            c, [str(i) for i in range(1, MAX_THREADS + 1)], str(MAX_THREADS)),
+            c, THREAD_CHOICES, str(DEFAULT_THREADS)),
             width=116)
         self.def_threads_e.grid(row=3, column=1, sticky="w", pady=5)
 

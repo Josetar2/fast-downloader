@@ -23,6 +23,14 @@ from . import netdisk
 DEFAULT_UA = "FastDownloader/1.0 (+https://github.com/)"
 DEFAULT_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB 读取缓冲
 
+# 线程数：默认 16（一般带宽下已能跑满），上限 128（应对单连接被限速的网盘/CDN）。
+DEFAULT_THREADS = 16
+MAX_THREADS = 128
+# 每个分块的最小字节数。线程数 = 分块数，块太小则「建立连接 + TLS 握手」
+# 的开销会超过传输本身，也会让临时文件数量暴涨、合并变慢，因此按文件大小
+# 自动收敛实际分块数（2 MB 以下不再切分）。
+MIN_CHUNK_SIZE = 2 * 1024 * 1024
+
 
 class DownloadError(Exception):
     pass
@@ -43,7 +51,7 @@ class Downloader:
         url: str,
         save_dir: str,
         filename: str | None = None,
-        threads: int = 16,
+        threads: int = DEFAULT_THREADS,
         timeout: int = 30,
         retries: int = 5,
         user_agent: str = DEFAULT_UA,
@@ -51,7 +59,7 @@ class Downloader:
         self.url = url
         self.save_dir = save_dir
         self.filename = filename or self._guess_filename(url)
-        self.threads = max(1, int(threads))
+        self.threads = max(1, min(int(threads), MAX_THREADS))
         self.timeout = timeout
         self.retries = retries
 
@@ -280,7 +288,16 @@ class Downloader:
 
     @staticmethod
     def _split_ranges(total: int, threads: int) -> list[tuple[int, int]]:
-        threads = max(1, min(threads, total))
+        """把 [0, total) 切成至多 threads 段。
+
+        除了总字节数，还按 min_chunk_size 收敛段数：块太小会让建连/TLS 握手
+        开销超过传输本身，临时文件与合并次数也随之暴涨。例如 100 MB 文件
+        即使选 128 线程，也只会切 50 块（每块 2 MB）。
+        """
+        threads = max(1, min(int(threads), MAX_THREADS))
+        if total > 0:
+            threads = min(threads, max(1, total // MIN_CHUNK_SIZE))
+        threads = max(1, min(threads, total or 1))
         base = total // threads
         rem = total % threads
         ranges = []
