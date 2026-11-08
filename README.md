@@ -13,8 +13,9 @@
 - 仅使用 Python 标准库，无需 `pip install`
 - 支持蓝奏云等「直链型网盘」分享链接自动解析下载（粘贴分享页链接即可，自动提取真实直链）
 - 现代扁平图标（蓝渐变圆角方块 + 下载箭头），纯标准库生成，已内嵌至 exe
-- **高 DPI 清晰渲染**：exe 内嵌 PerMonitorV2 清单 + Tk 按真实 DPI 缩放，高缩放屏（如 150%）不再模糊
-- **浅色现代界面**：白色侧边栏 + 灰蓝主区 + 白色圆角卡片，行内胶囊进度条与状态标签，主色 `#1E80FF`
+- **macOS 风格界面**：无边框圆角窗口 + 红黄绿交通灯、浅灰侧栏、圆角胶囊导航、白色圆角卡片与蓝色圆角按钮，主色 `#007AFF`
+- **窗口与内部布局自适应**：侧栏、卡片、输入框、任务行随窗口尺寸变化；窗口大小与位置自动记忆
+- **高 DPI 清晰渲染**：exe 内嵌 PerMonitor 清单，Tk 按真实 DPI 缩放字体，同时把几何尺寸等比放大、加深文字与边框对比度，高缩放屏（125% / 150%）不发虚
 
 ## 安装
 
@@ -65,8 +66,8 @@ dl.download(on_progress=lambda d, t, s: print(d, t, s))
 
 ```bash
 cd "项目目录"
-gh release create v1.2.0 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
-  --title "FastDownloader v1.2.0" \
+gh release create v1.4.0 dist/FastDownloader.exe dist/FastDownloader_portable.zip \
+  --title "FastDownloader v1.4.0" \
   --notes "高速多线程下载器 · 侧边导航多任务管理界面 · 蓝奏云等直链网盘自动解析 · 新扁平图标 · 单文件版 + 便携版（无 Temp 残留）"
 ```
 
@@ -84,7 +85,7 @@ py -3.14 -m venv D:\fd-venv
 D:\fd-venv\Scripts\pip install pyinstaller
 
 # 进入本项目目录后打包（--windowed 不弹黑框，--onefile 单文件，--icon 内嵌图标）
-D:\fd-venv\Scripts\pyinstaller --onefile --windowed --name FastDownloader --icon app.ico --add-data "app.ico;." run.py
+D:\fd-venv\Scripts\pyinstaller --onefile --windowed --name FastDownloader --icon app.ico --manifest app.manifest --add-data "app.ico;." run.py
 ```
 
 产物在 `dist/FastDownloader.exe`。直接双击运行即是图形界面；命令行用法：
