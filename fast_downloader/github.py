@@ -248,7 +248,13 @@ def resolve(url: str) -> dict | None:
         picked = _pick_asset(assets)
         if picked:
             more = f"Release 自动选中最匹配文件（共 {len(assets)} 个）" if len(assets) > 1 else "Release 资产"
-            return _as_download(picked["browser_download_url"], picked["name"], more)
+            # 备用通道：主域 github.com 不稳时，让 api.github.com 换签名
+            extra = {}
+            if picked.get("url"):
+                extra["alt_url"] = picked["url"]
+                extra["alt_headers"] = {"Accept": "application/octet-stream"}
+            return _as_download(picked["browser_download_url"], picked["name"],
+                                more, **extra)
         # 没有上传资产 → 退到源码包（codeload 直连，通常能下）
         ref = _ref_from(url)
         if not ref and kind in ("release", "repo"):
@@ -305,14 +311,16 @@ def _archive_name(repo: str, ref: str, ext: str) -> str:
     return f"{repo}-{label}.{ext}"
 
 
-def _as_download(direct: str, filename: str, note: str) -> dict:
-    return {
+def _as_download(direct: str, filename: str, note: str, **extra) -> dict:
+    out = {
         "url": direct,
         "headers": {"User-Agent": UA},
         "filename": filename,
         "note": note,
         "kind": classify(direct),
     }
+    out.update(extra)
+    return out
 
 
 def describe_error(url: str, exc: Exception) -> str:

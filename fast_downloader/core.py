@@ -10,9 +10,11 @@ Fast Downloader — 核心下载引擎（纯标准库，无第三方依赖）
 
 from __future__ import annotations
 
+import datetime
 import math
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -23,7 +25,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from . import github, netdisk
 
 DEFAULT_UA = "FastDownloader/1.0 (+https://github.com/)"
-DEFAULT_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB 读取缓冲
+DEFAULT_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB 写入缓冲
+# 读取缓冲单独调小：连接卡死时要靠「多久没收到数据」来判断，
+# 缓冲越小检测越灵敏（代价是多几次 write，忽略不计）
+READ_CHUNK_SIZE = 256 * 1024
+# 多久没有任何进展就判定连接挂死并强行断开（秒）
+STALL_TIMEOUT = 45
 
 # 线程数：默认 16（一般带宽下已能跑满），上限 128（应对单连接被限速的网盘/CDN）。
 DEFAULT_THREADS = 16
@@ -65,6 +72,42 @@ def _open(url: str, headers: dict, timeout: int, method: str = "GET"):
     return _OPENER.open(req, timeout=timeout)
 
 
+class _StallGuard:
+    """连接卡死检测。
+
+    有些服务器 / 代理在并发连接过多时会把连接挂起：既不报错也不送数据，
+    socket 超时也可能被零星心跳绕开，表现为下载永远停在某个百分比不动。
+    这里用独立计时器盯着「多久没有任何进展」，超时就把连接强行断开，
+    让重试逻辑接手 —— 挂起通常源于并发过高，别的块结束后重试就能过。
+    """
+
+    def __init__(self, resp, stall: float):
+        self.resp = resp
+        self.stall = stall
+        self._timer = None
+
+    def arm(self):
+        self.disarm()
+        self._timer = threading.Timer(self.stall, self._kill)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def disarm(self):
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _kill(self):
+        try:
+            sock = self.resp.fp.raw._sock
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            try:
+                self.resp.close()
+            except Exception:
+                pass
+
+
 class Downloader:
     def __init__(
         self,
@@ -75,6 +118,7 @@ class Downloader:
         timeout: int = 30,
         retries: int = 5,
         user_agent: str = DEFAULT_UA,
+        stall_timeout: int = STALL_TIMEOUT,
     ) -> None:
         self.url = url
         self.save_dir = save_dir
@@ -85,6 +129,7 @@ class Downloader:
         self.threads = max(1, min(int(threads), MAX_THREADS))
         self.timeout = timeout
         self.retries = retries
+        self.stall_timeout = stall_timeout
 
         self.filepath = os.path.join(save_dir, self.filename)
         self.part_dir = self.filepath + ".parts"
@@ -96,9 +141,17 @@ class Downloader:
         self._content_type = ""
         self.resolve_note = ""
         self._prepared = False
+        # 302 之后的最终地址：分块下载时直接复用，避免每个分块各走一次重定向
+        self._final_url = ""
+        self._final_expires = 0.0   # 签名过期时刻（unix 时间戳），0 = 未知
+        self._final_at = 0.0
+        # 备用通道：主地址连不上时换一条路（GitHub 资产改走 api.github.com 换签名）
+        self._alt_url = ""
+        self._alt_headers = {}
 
         self._downloaded = 0
-        self._lock_state = {"start": time.time(), "last": time.time(), "last_bytes": 0}
+        self._speed = 0.0            # 平滑后的传输速率（字节/秒）
+        self._last_bump_t = time.time()
         self.cancelled = False
 
     # ---------- 工具 ----------
@@ -114,9 +167,12 @@ class Downloader:
             name = name.replace(ch, "_")
         return name.strip() or "download.bin"
 
-    def _headers(self, extra: dict | None = None) -> dict:
+    def _headers(self, extra: dict | None = None, url: str | None = None) -> dict:
         h = {"User-Agent": self._ua}
         h.update(self.extra_headers)
+        # 备用地址（GitHub 资产走 api 换签名）需要特殊 Accept，否则返回的是 JSON 元数据
+        if url and self._alt_url and url == self._alt_url:
+            h.update(self._alt_headers)
         if extra:
             h.update(extra)
         return h
@@ -149,21 +205,94 @@ class Downloader:
         self.filename = os.path.basename(self.filepath)
         self.part_dir = self.filepath + ".parts"
 
+    # ---------- 重定向后的最终地址 ----------
+    def _remember_final(self, url: str) -> None:
+        """记下 302 之后的最终地址，并解析出签名过期时间。
+
+        GitHub 的下载链接要先去 github.com 换一张带签名的 CDN 地址，那一步在
+        慢网络下时通时不通。如果每个分块都各换一次，多线程会被重定向卡住；
+        换一次、大家一起用才稳。
+        """
+        if not url or url == self.effective_url:
+            return
+        self._final_url = url
+        self._final_at = time.time()
+        self._final_expires = 0.0
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        # 常见的两种写法：expires=秒数 / unix 时间戳，以及 GitHub CDN 用的
+        # Azure Blob 风格 se=2026-11-08T12:10:32Z
+        exp = (q.get("expires") or q.get("X-Amz-Expires") or q.get("se")
+               or q.get("ske") or [None])[0]
+        if exp:
+            try:
+                val = float(exp)
+                # 可能是 unix 时间戳，也可能是「从现在起多少秒」
+                self._final_expires = val if val > 1e9 else time.time() + val
+            except ValueError:
+                try:
+                    t = exp.replace("Z", "+00:00")
+                    self._final_expires = datetime.datetime.fromisoformat(
+                        t).timestamp()
+                except Exception:
+                    pass
+
+    def _pick_url(self) -> str:
+        """当前该用哪个地址发请求：优先复用还没过期的最终地址。"""
+        if not self._final_url:
+            return self.effective_url
+        now = time.time()
+        if self._final_expires:
+            if now < self._final_expires - 30:      # 留 30 秒余量
+                return self._final_url
+        elif now - self._final_at < 240:
+            return self._final_url
+        return self.effective_url
+
+    def _drop_final(self) -> None:
+        self._final_url = ""
+        self._final_expires = 0.0
+        self._final_at = 0.0
+
     def probe(self) -> tuple[int, bool]:
+        length, ranged = self._probe_once()
+        if not length and self._alt_url and self._alt_url != self.effective_url:
+            # 主地址连不上（GitHub 主域在部分网络下时通时不通）：换备用通道，
+            # 由 api.github.com 换签名，通常稳定得多。
+            # 注意别把 _alt_url 清空 —— 它同时是「当前正在用备用通道」的标记，
+            # 清掉会让特殊请求头（Accept: octet-stream）失效，api 就会返回
+            # JSON 元数据而不是文件。
+            self.effective_url = self._alt_url
+            length, ranged = self._probe_once()
+        self.total = length
+        self.supports_range = ranged
+        return self.total, self.supports_range
+
+    def _probe_once(self) -> tuple[int, bool]:
         # 探测只是"问问有多大"，不该让界面等太久。
         t_probe = min(self.timeout, 8)
         length, accept, ctype, cdisp = 0, "", "", ""
         unreachable = False
-        try:
-            with _open(self.effective_url, self._headers(), t_probe, method="HEAD") as r:
-                length = int(r.headers.get("Content-Length", "0") or 0)
-                accept = (r.headers.get("Accept-Ranges", "") or "").lower()
-                ctype = (r.headers.get("Content-Type", "") or "").lower()
-                cdisp = r.headers.get("Content-Disposition", "") or ""
-        except urllib.error.HTTPError:
-            pass          # 服务器不支持 HEAD，下面用 Range 再问一次
-        except Exception:
-            unreachable = True
+        for attempt in range(3):
+            try:
+                with _open(self.effective_url, self._headers(url=self.effective_url),
+                           t_probe, method="HEAD") as r:
+                    length = int(r.headers.get("Content-Length", "0") or 0)
+                    accept = (r.headers.get("Accept-Ranges", "") or "").lower()
+                    ctype = (r.headers.get("Content-Type", "") or "").lower()
+                    cdisp = r.headers.get("Content-Disposition", "") or ""
+                    try:
+                        self._remember_final(r.geturl())
+                    except Exception:
+                        pass
+                break
+            except urllib.error.HTTPError:
+                break           # 服务器不支持 HEAD，换 Range 探测
+            except Exception:
+                # 代理 / 网络偶发失败（GitHub 主域尤其明显）：重试两次再放弃
+                if attempt >= 2:
+                    unreachable = True
+                else:
+                    time.sleep(1.5)
 
         self._content_type = ctype
         name = self._filename_from_cd(cdisp)
@@ -171,48 +300,63 @@ class Downloader:
             self.filename = name
             self._sync_paths()
 
-        # 连都连不上，再探一次只是白等一个超时
-        if not unreachable and not (length and accept == "bytes"):
-            try:
-                with _open(
-                    self.effective_url,
-                    self._headers({"Range": "bytes=0-0"}),
-                    t_probe,
-                    method="GET",
-                ) as r:
-                    cr = r.headers.get("Content-Range", "")
-                    if cr and "/" in cr:
-                        length = int(cr.split("/")[-1])
-                        accept = "bytes"
-                    # HEAD 不被支持时，这里也能顺手补到类型与文件名
-                    self._content_type = self._content_type or (
-                        r.headers.get("Content-Type", "") or "").lower()
-                    if self._auto_name:
-                        n2 = self._filename_from_cd(
-                            r.headers.get("Content-Disposition", "") or "")
-                        if n2:
-                            self.filename = n2
-                            self._sync_paths()
-            except Exception:
-                pass
+        # HEAD 拿不到就换 Range 问一次（HEAD 被拒但 GET 可用的服务器不少）。
+        # 连不上时也值得再试这一次：慢链路下分块比单线程快好几倍，
+        # 为了总大小丢掉分块能力不划算。
+        if not (length and accept == "bytes"):
+            # 依次试原始地址和缓存下来的 CDN 地址：GitHub 的原始地址要过
+            # github.com 主域（不稳），而 CDN 地址稳定且同样支持 Range
+            for probe_url in (self.effective_url, self._final_url):
+                if not probe_url:
+                    continue
+                try:
+                    with _open(
+                        probe_url,
+                        self._headers({"Range": "bytes=0-0"}, url=probe_url),
+                        t_probe,
+                        method="GET",
+                    ) as r:
+                        cr = r.headers.get("Content-Range", "")
+                        if cr and "/" in cr:
+                            length = int(cr.split("/")[-1])
+                            accept = "bytes"
+                        try:
+                            self._remember_final(r.geturl())
+                        except Exception:
+                            pass
+                        # HEAD 不被支持时，这里也能顺手补到类型与文件名
+                        self._content_type = self._content_type or (
+                            r.headers.get("Content-Type", "") or "").lower()
+                        if self._auto_name:
+                            n2 = self._filename_from_cd(
+                                r.headers.get("Content-Disposition", "") or "")
+                            if n2:
+                                self.filename = n2
+                                self._sync_paths()
+                    break
+                except Exception:
+                    continue
 
-        self.total = length
-        self.supports_range = accept == "bytes"
-        return self.total, self.supports_range
+        return length, accept == "bytes"
 
     # ---------- 进度 ----------
     def _bump(self, n: int) -> None:
+        """记录新到的字节，同时更新速率。
+
+        速率在这里算，而不是在采样点算：慢链路下一个读取缓冲要几十秒，
+        按 0.2 秒采样几乎永远算不出速度，界面只会一直显示 0。
+        """
+        now = time.time()
+        dt = now - self._last_bump_t
+        if dt > 0.01:
+            inst = n / dt
+            # 指数平滑，避免数字来回跳
+            self._speed = inst if self._speed <= 0 else self._speed * 0.7 + inst * 0.3
+        self._last_bump_t = now
         self._downloaded += n
 
     def _snapshot_speed(self) -> float:
-        now = time.time()
-        st = self._lock_state
-        dt = now - st["last"]
-        if dt <= 0:
-            return 0.0
-        speed = (self._downloaded - st["last_bytes"]) / dt
-        st["last"], st["last_bytes"] = now, self._downloaded
-        return speed
+        return self._speed
 
     def speed(self) -> float:
         return self._snapshot_speed()
@@ -232,30 +376,48 @@ class Downloader:
             return expected
 
         last_end = start - 1
-        for attempt in range(1, self.retries + 1):
+        attempt = 0
+        while attempt < self.retries:
+            url = self._pick_url()
             try:
                 with _open(
-                    self.effective_url,
-                    self._headers({"Range": f"bytes={last_end + 1}-{end}"}),
+                    url,
+                    self._headers({"Range": f"bytes={last_end + 1}-{end}"}, url=url),
                     self.timeout,
                     method="GET",
                 ) as r:
                     mode = "ab" if (last_end + 1) > start else "wb"
+                    guard = _StallGuard(r, self.stall_timeout)
+                    guard.arm()
                     with open(part, mode) as f:
                         while True:
-                            buf = r.read(DEFAULT_CHUNK_SIZE)
+                            buf = r.read(READ_CHUNK_SIZE)
                             if not buf:
                                 break
                             f.write(buf)
                             last_end += len(buf)
                             self._bump(len(buf))
+                            guard.arm()      # 有进展就重新计时
                             if self.cancelled:
                                 raise Cancelled()
+                    guard.disarm()
                 return last_end - start + 1
             except Cancelled:
                 raise
+            except urllib.error.HTTPError as e:
+                # 复用的签名地址失效（过期 / 被拒）：丢掉缓存，回原地址重走重定向
+                if e.code in (400, 401, 403) and url != self.effective_url:
+                    self._drop_final()
+                    continue
+                attempt += 1
+                if attempt >= self.retries:
+                    raise DownloadError(
+                        f"分块 {idx} 下载失败（已重试 {self.retries} 次）："
+                        + self._explain(e))
+                time.sleep(min(2 ** attempt, 8))
             except Exception as e:
-                if attempt == self.retries:
+                attempt += 1
+                if attempt >= self.retries:
                     raise DownloadError(
                         f"分块 {idx} 下载失败（已重试 {self.retries} 次）："
                         + self._explain(e))
@@ -298,6 +460,9 @@ class Downloader:
                 self.resolve_note = res.get("note") or ""
                 if res.get("filename") and self._auto_name:
                     self.filename = res["filename"]
+                if res.get("alt_url"):
+                    self._alt_url = res["alt_url"]
+                    self._alt_headers = res.get("alt_headers") or {}
         elif netdisk.is_supported(self.url):
             try:
                 resolved = netdisk.resolve(self.url)
@@ -337,7 +502,8 @@ class Downloader:
             return self.filepath
 
         self._downloaded = 0
-        self._lock_state = {"start": time.time(), "last": time.time(), "last_bytes": 0}
+        self._speed = 0.0            # 平滑后的传输速率（字节/秒）
+        self._last_bump_t = time.time()
         self.cancelled = False
 
         done_ev = threading.Event()
@@ -368,7 +534,7 @@ class Downloader:
         self._cleanup_parts()
         done = self.total or self._downloaded
         if on_progress:
-            on_progress(done, done, 0.0)
+            on_progress(done, done, self._speed)
         return self.filepath
 
     def cancel(self) -> None:
@@ -383,7 +549,8 @@ class Downloader:
         if resume:
             headers["Range"] = f"bytes={os.path.getsize(part)}-"
         try:
-            r = _open(self.effective_url, self._headers(headers), self.timeout,
+            u = self._pick_url()
+            r = _open(u, self._headers(headers, url=u), self.timeout,
                       method="GET")
         except Cancelled:
             raise
@@ -391,21 +558,29 @@ class Downloader:
             _rmdir(self.part_dir)
             raise DownloadError("连接失败：" + self._explain(e))
         with r:
+            try:
+                self._remember_final(r.geturl())
+            except Exception:
+                pass
             cr = r.headers.get("Content-Range", "")
             if cr and "/" in cr and self.total == 0:
                 self.total = int(cr.split("/")[-1])
             if not self.total:
                 self.total = int(r.headers.get("Content-Length", "0") or 0)
             mode = "ab" if resume else "wb"
+            guard = _StallGuard(r, self.stall_timeout)
+            guard.arm()
             with open(part, mode) as f:
                 while True:
-                    buf = r.read(DEFAULT_CHUNK_SIZE)
+                    buf = r.read(READ_CHUNK_SIZE)
                     if not buf:
                         break
                     f.write(buf)
                     self._bump(len(buf))
+                    guard.arm()
                     if self.cancelled:
                         raise Cancelled()
+            guard.disarm()
         if os.path.exists(self.filepath):
             os.remove(self.filepath)
         os.rename(part, self.filepath)

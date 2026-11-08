@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import github, netdisk
 from .core import DEFAULT_THREADS, MAX_THREADS, Downloader, DownloadError
 
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 
 # 默认窗口尺寸：1000×600 物理像素（用户指定够用的尺寸）。
 DEFAULT_W, DEFAULT_H = 1000, 600

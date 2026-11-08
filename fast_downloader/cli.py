@@ -48,9 +48,9 @@ def main(argv: list[str] | None = None) -> int:
 
     start = time.time()
     try:
-        path = dl.download(
-            on_progress=lambda d, t, _s: _render(d, t, dl.speed())
-        )
+        # 速度直接用回调给的第三个参数：再调 dl.speed() 会把上一段增量清零，
+        # 进度条上的速度会永远显示 0
+        path = dl.download(on_progress=lambda d, t, sp: _render(d, t, sp))
     except DownloadError as e:
         print(f"\n下载失败：{e}", file=sys.stderr)
         return 1
