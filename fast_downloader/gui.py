@@ -272,7 +272,20 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("高速下载器")
-        self.geometry("900x680")
+        # 默认尺寸随屏幕自适应（约 70% 宽 / 80% 高，限制上下限）
+        try:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            w = max(900, min(1180, int(sw * 0.7)))
+            h = max(620, min(780, int(sh * 0.82)))
+            self.geometry(f"{w}x{h}")
+        except Exception:
+            self.geometry("1000x680")
+        # 允许自由缩放，并设最小尺寸，避免缩太小导致布局崩坏
+        self.resizable(True, True)
+        self.minsize(860, 560)
+        # 关闭时记住窗口位置/大小
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         # DPI 缩放：让 Tk 按真实 DPI 设置字体尺寸，避免模糊/过小
         try:
             import ctypes
@@ -303,6 +316,7 @@ class App(tk.Tk):
         self._build_done()
         self._build_settings()
         self._show("新建下载")
+        self._center_on_screen()
         self._tick()
 
     # ---------- 路径 ----------
@@ -311,6 +325,65 @@ class App(tk.Tk):
             base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
             return os.path.join(base, name)
         return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), name)
+
+    # ---------- 窗口定位（避免偏出屏幕/左侧被裁切）----------
+    def _center_on_screen(self):
+        self.update_idletasks()
+        saved = self._load_geom()
+        if saved:
+            self.geometry(saved)
+            self.update_idletasks()
+            return
+        try:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+        except Exception:
+            return
+        w = self.winfo_width()
+        h = self.winfo_height()
+        # 限制不超出屏幕（高 DPI 下避免溢出），留出任务栏空间
+        w = min(w, max(360, sw - 20))
+        h = min(h, max(280, sh - 80))
+        if w != self.winfo_width() or h != self.winfo_height():
+            self.geometry(f"{w}x{h}")
+            self.update_idletasks()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    # ---------- 窗口位置记忆（仅写在程序同目录，便携版不跨盘）----------
+    def _config_path(self) -> str:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, "fastdownloader.ini")
+
+    def _load_geom(self):
+        try:
+            import re
+            p = self._config_path()
+            if not os.path.exists(p):
+                return None
+            with open(p, "r", encoding="utf-8") as f:
+                data = f.read().strip()
+            if re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", data):
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _save_geom(self):
+        try:
+            self.update_idletasks()
+            with open(self._config_path(), "w", encoding="utf-8") as f:
+                f.write(self.geometry())
+        except Exception:
+            pass
+
+    def _on_close(self):
+        self._save_geom()
+        self.destroy()
 
     # ---------- 样式 ----------
     def _build_style(self):
