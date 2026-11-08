@@ -1011,7 +1011,7 @@ class App(tk.Tk):
         rown = tk.Frame(f, bg=CARD)
         rown.grid(row=5, column=0, columnspan=3, sticky="ew", pady=2)
         rown.columnconfigure(0, weight=1)
-        rown.columnconfigure(1, minsize=96)  # 与带按钮的两行保持同一右边缘
+        rown.columnconfigure(1, minsize=_s(96))  # 与带按钮的两行保持同一右边缘
         self.name_e = Field(rown, _make_entry)
         self.name_e.grid(row=0, column=0, sticky="ew")
 
